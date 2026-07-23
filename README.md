@@ -73,6 +73,29 @@ fit misreads as −0.72) and runs in CI.
   `?width=fluid`, `?refresh=<seconds>`.
 - **Not source, not committed:** `.cache/` (runtime snapshots) and `logs/`.
 
+## Deployment
+
+- **Windows:** `run_overnight.ps1` (supervised, self-restarting).
+- **Linux/container:** a [`Dockerfile`](Dockerfile) is provided; the container
+  runtime's restart policy replaces the supervisor. Mount a volume at
+  `/app/.cache` to persist last-known-good data across restarts. *(The Dockerfile
+  is written against the pinned requirements but was not built in the dev
+  environment — smoke-test before relying on it.)*
+- **Put a reverse proxy in front of it.** Streamlit should not be exposed to the
+  public internet directly; terminate TLS and (if needed) add auth at nginx /
+  Caddy / your platform's ingress. There is no built-in authentication — the
+  dashboard is read-only and public by design.
+
+### Known limitations (by design or scope)
+
+- Auto-refresh only ticks while a browser tab is open (inherent to Streamlit
+  fragments); the process stays healthy regardless.
+- Single-node. In-process caches and the Nominatim rate-limit are per-worker, so
+  this is not built for horizontal scaling. Heavy geocoding traffic should move
+  to a self-hosted or commercial geocoder (Nominatim's public service is
+  rate-limited and best-effort).
+- No metrics/alerting beyond process supervision and the `logs/` trail.
+
 ## Architecture
 
 Two independent chains — live fetch/scoring and ML analysis — behind a
