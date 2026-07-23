@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Sequence
 
 from analyzer import StressAssessment
-from api_clients import Region, RegionSnapshot
+from api_clients import BuoySnapshot, Region, RegionSnapshot
 from ui import (
     BORDER_STRONG, CANOPY, INK, LINE, MIST, PAPER, PAPER_DIM, SIGNAL,
     SOURCE_COLOURS, TerminalConfig, esc, fmt,
@@ -71,6 +71,59 @@ def _section(label: str, rows: Iterable[str], *, first: bool = False) -> str:
         f'<div class="{divider.strip() or ""}">'
         f'<div class="tm-seclabel">{esc(label)}</div>{"".join(rows)}</div>'
     )
+
+
+def _drawer(label: str, body: str, *, open_: bool = False) -> str:
+    """A click-to-expand detail drawer (native <details>, no JavaScript).
+
+    The summary is always visible; the body is revealed on click. Note that the
+    open/closed state is DOM state and resets when the page re-renders on the
+    auto-refresh cycle — acceptable at a multi-minute cadence.
+    """
+    if not body:
+        return ""
+    attr = " open" if open_ else ""
+    return (
+        f'<details class="tm-drawer"{attr}><summary>{esc(label)}</summary>'
+        f'<div class="tm-drawer-body">{body}</div></details>'
+    )
+
+
+def _mini_table(headers: Sequence[tuple[str, bool]], rows: Sequence[Sequence]) -> str:
+    """Compact table. ``headers`` is (text, is_numeric); each cell in ``rows`` is
+    a value or a ``(value, css_class)`` pair."""
+    head = "".join(
+        f'<th class="num">{esc(h)}</th>' if num else f"<th>{esc(h)}</th>"
+        for h, num in headers
+    )
+    body_rows = []
+    for row in rows:
+        cells = []
+        for i, cell in enumerate(row):
+            cls = "num" if headers[i][1] else ""
+            if isinstance(cell, tuple):
+                value, extra = cell
+                cls = f"{cls} {extra}".strip()
+            else:
+                value = cell
+            cells.append(f'<td class="{cls}">{esc(value)}</td>' if cls else f"<td>{esc(value)}</td>")
+        body_rows.append(f"<tr>{''.join(cells)}</tr>")
+    return (
+        f'<table class="tm-mini"><thead><tr>{head}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody></table>'
+    )
+
+
+def _detail_rows(pairs: Sequence[tuple[str, str]]) -> str:
+    """Key/value detail block for a drawer body."""
+    out = ['<div class="mx-kv" style="font-size:10.5px">']
+    for key, value in pairs:
+        out.append(
+            f'<div><span class="k" style="min-width:210px;color:{MIST}">{esc(key)}</span>'
+            f'<span style="color:{PAPER}">{esc(value)}</span></div>'
+        )
+    out.append("</div>")
+    return "".join(out)
 
 
 def _nice_ceiling(value: float, divisions: int = 4) -> float:
@@ -237,6 +290,81 @@ def render_footer() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Detail-drawer content builders (all from already-fetched live data)
+# --------------------------------------------------------------------------- #
+def _component_detail(assessment: StressAssessment) -> str:
+    """Full derivation of every score component: weights, quality, the complete
+    detail dict each component computed, and its notes."""
+    blocks: list[str] = []
+    for component in assessment.components:
+        state = (
+            f"score {component.score:.1f}"
+            if component.available and component.score is not None
+            else "EXCLUDED"
+        )
+        blocks.append(
+            f'<div style="color:{SIGNAL};font-size:10px;letter-spacing:0.1em;'
+            f'margin:8px 0 2px 0">{esc(component.label)} — {esc(state)}</div>'
+        )
+        pairs: list[tuple[str, str]] = []
+        if not component.available:
+            pairs.append(("excluded because", component.unavailable_reason or "unavailable"))
+        else:
+            pairs.append(
+                ("effective weight",
+                 f"{assessment.effective_weights.get(component.key, 0.0):.3f}")
+            )
+            pairs.append(("nominal weight", f"{component.weight:.2f}"))
+            pairs.append(("data quality", f"{component.quality:.0%}"))
+            for key, value in (component.detail or {}).items():
+                pairs.append((key.replace("_", " "), str(value)))
+        blocks.append(_detail_rows(pairs))
+        if component.notes:
+            blocks.append(_detail_rows([("note", n) for n in component.notes]))
+
+    tail: list[tuple[str, str]] = [
+        ("effective weights",
+         "  ".join(f"{k}={v:.3f}" for k, v in assessment.effective_weights.items())),
+        ("confidence", f"{assessment.confidence:.0%}"),
+        ("computed at", assessment.computed_at.strftime("%Y-%m-%d %H:%M:%SZ")),
+    ]
+    blocks.append(
+        f'<div style="color:{SIGNAL};font-size:10px;margin:8px 0 2px 0">BLEND</div>'
+        + _detail_rows(tail)
+    )
+    if assessment.degradations:
+        blocks.append(
+            f'<div style="color:{SIGNAL};font-size:10px;margin:8px 0 2px 0">'
+            "DEGRADATIONS</div>"
+            + _detail_rows([("!", d) for d in assessment.degradations])
+        )
+    return "".join(blocks)
+
+
+def _buoy_detail(buoy: BuoySnapshot) -> str:
+    """Full in-situ station provenance: candidates tried, cadence, and notes."""
+    times = buoy.history_times or []
+    span = ""
+    if len(times) >= 2:
+        span = f"{times[0]:%Y-%m-%d %H:%MZ} → {times[-1]:%Y-%m-%d %H:%MZ}"
+    non_null = sum(1 for v in buoy.history_wtmp_c if v is not None)
+    pairs = [
+        ("candidate stations tried", ", ".join(buoy.stations_tried) or "--"),
+        ("selected station", buoy.station or "none"),
+        ("station position",
+         f"{buoy.latitude:.3f}, {buoy.longitude:.3f}"
+         if buoy.latitude is not None else "--"),
+        ("readings in 48h window", str(len(times))),
+        ("with water temperature", str(non_null)),
+        ("observation span", span or "--"),
+    ]
+    body = _detail_rows(pairs)
+    if buoy.notes:
+        body += _detail_rows([("note", n) for n in buoy.notes])
+    return body
+
+
+# --------------------------------------------------------------------------- #
 # Sidebar
 # --------------------------------------------------------------------------- #
 def _sidebar(
@@ -332,12 +460,17 @@ def _sidebar(
             _row("Stations tried", ", ".join(buoy.stations_tried) or "--", small_key=True),
         ]
 
+    score_drawer = _drawer("METHODOLOGY & COMPONENT DETAIL", _component_detail(assessment))
+    buoy_drawer = _drawer("ALL STATIONS & NOTES", _buoy_detail(buoy)) if buoy else ""
+
     return (
         '<aside class="tm-side">'
         + hero
         + _section("SCORE DERIVATION", derivation)
+        + score_drawer
         + _section("KEY METRICS", metrics)
         + _section(buoy_label, buoy_rows)
+        + buoy_drawer
         + "</aside>"
     )
 
@@ -380,11 +513,39 @@ def _sst_panel(snapshot: RegionSnapshot, assessment: StressAssessment,
         if series
         else '<div class="tm-mist" style="font-size:11.5px">no SST series available</div>'
     )
+
+    thermal = assessment.component("thermal")
+    tdetail = (thermal.detail if thermal else {}) or {}
+    thermal_pairs = [
+        ("current SST", fmt(assessment.current_sst_c, ".2f", " °C")),
+        ("SST source", assessment.sst_source or "--"),
+        ("in-situ vs model divergence", fmt(assessment.sst_cross_check_delta_c, "+.2f", " °C")),
+        ("10-year baseline mean", fmt(assessment.baseline_mean_c, ".3f", " °C")),
+        ("baseline std deviation", fmt(tdetail.get("baseline_std_c"), ".3f", " °C")),
+        ("anomaly", fmt(assessment.anomaly_c, "+.3f", " °C")),
+        ("anomaly (standard deviations)", fmt(assessment.anomaly_sigma, "+.3f")),
+        ("decadal trend (point estimate)",
+         fmt(assessment.trend_c_per_decade, "+.3f", " °C/decade")),
+        ("trend standard error", fmt(assessment.trend_stderr_c_per_decade, ".3f")),
+        ("trend r squared", fmt(assessment.trend_r2, ".3f")),
+        ("trend scored (95% lower bound)",
+         fmt(assessment.trend_scored_c_per_decade, ".3f", " °C/decade")),
+        ("marine heatwave (> 10y p90)", "ACTIVE" if assessment.marine_heatwave else "none"),
+        ("anomaly term / trend term",
+         f"{tdetail.get('anomaly_term', '--')} / {tdetail.get('trend_term', '--')}"),
+    ]
+    if sea_state is not None:
+        thermal_pairs.append(("model SST coverage", f"{sea_state.coverage:.0%}"))
+        thermal_pairs.append(
+            ("current wave height", fmt(sea_state.current_wave_height_m, ".2f", " m"))
+        )
+    drawer = _drawer("THERMAL DETAIL & TREND STATISTICS", _detail_rows(thermal_pairs))
+
     return (
         "<section>"
         f'<div class="tm-panelhead">'
         f'{_chip(f"SEA SURFACE TEMPERATURE — {region.name.upper()}")}{legend}</div>'
-        f"{body}</section>"
+        f"{body}{drawer}</section>"
     )
 
 
@@ -404,12 +565,36 @@ def _baseline_panel(snapshot: RegionSnapshot, assessment: StressAssessment) -> s
         f"{climatology.anchor_day:02d} ±{climatology.window_days}D, "
         f"{climatology.years_covered} YEARS"
     )
+
+    per_year = _mini_table(
+        [("Year", False), ("Window mean °C", True)],
+        [[str(y), (f"{m:.3f}", "num")] for y, m in climatology.yearly_means.items()],
+    )
+    base_pairs = [
+        ("baseline mean", fmt(climatology.baseline_mean, ".3f", " °C")),
+        ("baseline std deviation", fmt(climatology.baseline_std, ".3f", " °C")),
+        ("90th percentile (heatwave line)", fmt(climatology.baseline_p90, ".3f", " °C")),
+        ("daily observations pooled", f"{climatology.observations:,}"),
+        ("years covered", str(climatology.years_covered)),
+        ("years that failed to fetch",
+         ", ".join(map(str, climatology.failed_years)) or "none"),
+        ("day-of-year window",
+         f"±{climatology.window_days} d around {climatology.anchor_month:02d}-"
+         f"{climatology.anchor_day:02d}"),
+        ("OISST grid point",
+         f"{climatology.latitude:.3f}, {climatology.longitude:.3f}"
+         if climatology.latitude is not None else "--"),
+    ]
+    drawer = _drawer("PER-YEAR BASELINE & STATISTICS", per_year + _detail_rows(base_pairs))
+
     return (
         "<section>"
         + _chip(label, block=True)
         + '<div style="margin-top:10px">'
         + _bar_chart(years, values, assessment.current_sst_c)
-        + "</div></section>"
+        + "</div>"
+        + drawer
+        + "</section>"
     )
 
 
@@ -432,16 +617,67 @@ def _composition_panels(snapshot: RegionSnapshot) -> str:
                        for name, count in top]
     infra_max = max((m for _, m, _ in infra_items), default=1.0)
 
+    # --- OBIS drawer: top taxa + the full phylum breakdown ---------------- #
+    obis_drawer = ""
+    if obis and (obis.top_taxa or obis.phylum_records):
+        total = obis.total_classified_records or 1
+        parts = []
+        if obis.top_taxa:
+            # Three columns keep the table inside the half-width panel; class and
+            # rank are dropped (rank is almost always "Species").
+            parts.append(_mini_table(
+                [("Scientific name", False), ("Phylum", False), ("Records", True)],
+                [[(t.get("scientificName") or "—", "name"), t.get("phylum") or "—",
+                  (f"{t.get('records', 0):,}", "num")]
+                 for t in obis.top_taxa[:25]],
+            ))
+        if obis.phylum_records:
+            ordered = sorted(obis.phylum_records.items(), key=lambda kv: kv[1], reverse=True)
+            parts.append('<div style="height:8px"></div>')
+            parts.append(_mini_table(
+                [("Phylum (all)", False), ("Records", True), ("Share", True)],
+                [[p, (f"{c:,}", "num"), (f"{c / total:.1%}", "num")] for p, c in ordered],
+            ))
+        obis_drawer = _drawer(
+            f"TOP TAXA & FULL COMPOSITION ({obis.checklist_sampled} taxa sampled)",
+            "".join(parts),
+        )
+
+    # --- infrastructure drawer: every charted seamark type ---------------- #
+    infra_drawer = ""
+    if infra and infra.type_breakdown:
+        types_table = _mini_table(
+            [("Seamark type", False), ("Count", True)],
+            [[t.replace("_", " "), (f"{c:,}", "num")]
+             for t, c in infra.type_breakdown.items()],
+        )
+        infra_pairs = [
+            ("charted features (total)", f"{infra.total_count:,}"),
+            ("nodes / ways / relations",
+             f"{infra.node_count:,} / {infra.way_count:,} / {infra.relation_count:,}"),
+            ("bounding-box area", f"{infra.area_km2:,.0f} km²"),
+            ("density", f"{infra.density_per_1000km2:.2f} per 1000 km²"),
+            ("routing/berthing (sampled)",
+             f"{infra.traffic_features:,} of {infra.sampled_elements:,}"),
+            ("traffic share", f"{infra.traffic_share:.1%}"),
+            ("distinct seamark types", str(len(infra.type_breakdown))),
+        ]
+        infra_drawer = _drawer(
+            "FULL SEAMARK BREAKDOWN", types_table + _detail_rows(infra_pairs)
+        )
+
     return (
         '<div style="display:flex;gap:24px">'
         '<section style="flex:1;min-width:0">'
         + _chip("OBIS BIODIVERSITY — PHYLUM COMPOSITION", block=True)
         + f'<div style="margin-top:10px">{_hbars(bio_items, 120, bio_max)}</div>'
-        "</section>"
+        + obis_drawer
+        + "</section>"
         '<section style="flex:1;min-width:0">'
         + _chip("OPENSEAMAP MARITIME INFRASTRUCTURE", block=True)
         + f'<div style="margin-top:10px">{_hbars(infra_items, 150, infra_max)}</div>'
-        "</section></div>"
+        + infra_drawer
+        + "</section></div>"
     )
 
 

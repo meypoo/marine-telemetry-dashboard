@@ -313,6 +313,24 @@ def _terminal_css(config: TerminalConfig) -> str:
   .tm-hfill {{ background: {CANOPY}; height: 15px; }}
   .tm-hvalue {{ width: 40px; font-size: 11px; color: {PAPER_DIM}; text-align: right; }}
 
+  /* --- expandable detail drawers (native <details>, no JS) --- */
+  .tm-drawer {{ margin-top: 8px; border-top: 1px solid {LINE}; }}
+  .tm-drawer > summary {{ cursor: pointer; list-style: none; color: {SIGNAL};
+      font-size: 9.5px; letter-spacing: 0.14em; text-transform: uppercase;
+      padding: 6px 0 4px 0; user-select: none; }}
+  .tm-drawer > summary::-webkit-details-marker {{ display: none; }}
+  .tm-drawer > summary::before {{ content: "\\25B8  "; }}
+  .tm-drawer[open] > summary::before {{ content: "\\25BE  "; }}
+  .tm-drawer > summary:hover {{ color: {PAPER}; }}
+  .tm-drawer-body {{ padding: 4px 0 10px 0; overflow-x: auto; }}
+  .tm-mini {{ width: 100%; border-collapse: collapse; font-size: 10.5px; }}
+  .tm-mini th {{ color: {MIST}; text-align: left; font-weight: 400;
+      padding: 3px 12px 3px 0; border-bottom: 1px solid {LINE}; white-space: nowrap; }}
+  .tm-mini td {{ color: {PAPER}; padding: 2px 12px 2px 0;
+      border-bottom: 1px solid #16231b; white-space: nowrap; }}
+  .tm-mini td.num, .tm-mini th.num {{ text-align: right; color: {PAPER_DIM}; }}
+  .tm-mini td.name {{ color: {CANOPY}; }}
+
   /* --- stats strip --- */
   .tm-stats {{ display: flex; gap: 24px; border-top: 1px solid {LINE}; padding-top: 16px; }}
   .tm-statcol {{ flex: 1; }}

@@ -167,6 +167,9 @@ def _fidelity() -> None:
         "6 stat tiles": body.count('class="tm-tile"') == 6,
         "15 stat rows": body.count('class="tm-statrow"') == 15,
         "12 hbar rows": body.count('class="tm-hrow"') == 12,
+        # Expandable detail drawers (native <details>), from live data.
+        "detail drawers present": 5 <= body.count("<details") <= 7,
+        "drawer mini-tables present": body.count('class="tm-mini"') >= 2,
     }
     bad = [name for name, ok in checks.items() if not ok]
     if bad:
