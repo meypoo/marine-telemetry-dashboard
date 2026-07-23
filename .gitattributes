@@ -1,0 +1,4 @@
+# Normalise line endings: LF in the repo for text, CRLF only where Windows needs it.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.csv text eol=lf

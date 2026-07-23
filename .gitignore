@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime state — regenerated live, never source.
+# (Comments must be on their own lines; git has no inline comments.)
+.cache/
+logs/
+
+# Local Claude Code permission state (machine-specific, not source)
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

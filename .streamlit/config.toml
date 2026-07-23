@@ -1,0 +1,31 @@
+# Palette shared with the developer's portfolio site. Two accents only:
+# amber (#E4B34A) for alerts/labels and canopy green (#3E8F62) for primary marks.
+# There is deliberately no alert-red hue.
+[theme]
+base = "dark"
+backgroundColor = "#0C1512"
+secondaryBackgroundColor = "#16231B"
+primaryColor = "#E4B34A"
+textColor = "#EDF2EC"
+font = "monospace"
+
+[server]
+headless = true
+runOnSave = false
+fileWatcherType = "none"
+# Long-running unattended sessions: keep websockets alive and cap upload size.
+enableWebsocketCompression = true
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[runner]
+fastReruns = true
+
+[logger]
+level = "info"

@@ -1,0 +1,13 @@
+# Pinned to the versions this project was built and verified against.
+# Install with:  pip install -r requirements.txt
+
+httpx==0.28.1           # async HTTP for all four upstream APIs
+pandas==2.2.3           # tabular handling in the Data Lab
+pydantic==2.11.3        # typed models + JSON round-trip for the last-good cache
+streamlit==1.44.0       # UI shell; st.fragment(run_every=...) drives auto-refresh
+scikit-learn==1.9.0     # IsolationForest / PCA / KMeans
+scipy==1.15.2           # Theil-Sen, Kendall tau, autocorrelation peak finding
+numpy==2.2.4            # pulled in by pandas/scipy; pinned for reproducibility
+openpyxl==3.1.5         # Data Lab .xlsx/.xls uploads (the uploader advertises them)
+
+# Geocoding (Nominatim) and all HTTP go through httpx above — no extra dependency.
