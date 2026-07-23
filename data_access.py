@@ -13,6 +13,23 @@ crash the page. Every load returns a :class:`LoadResult`:
 
 The staleness is always reported rather than hidden: ``LoadResult.stale`` drives
 the LIVE/STALE indicator, and ``error`` carries the reason the refresh failed.
+
+**Volatility-tiered caching.** The five feeds age at very different rates, so
+they are cached in two tiers rather than as one blob:
+
+* the *dynamic* tier — in-situ buoy and model SST — changes in minutes to hours
+  and is cached briefly (``DYNAMIC_TTL``), keyed by ``(code, nonce)`` so the
+  REFRESH button re-pulls it;
+* the *context* tier — the OISST day-of-year baseline, OBIS biodiversity and
+  OpenSeaMap infrastructure — is effectively stable within a calendar day (the
+  baseline lags two weeks; biodiversity and infrastructure change over months),
+  so it is keyed by ``(code, UTC date)`` and cached for a day.
+
+The two tiers are fetched concurrently *within* a tier and composed into the
+``RegionSnapshot`` the analyzer and UI already expect. The common path — a
+timed refresh where the context tier is still fresh — then re-fetches only the
+fast feeds (a few seconds) instead of the whole ~70-second baseline every
+cycle. A cold miss of both tiers runs them back to back, a small, rare cost.
 """
 
 from __future__ import annotations
@@ -27,12 +44,27 @@ from pathlib import Path
 import streamlit as st
 
 from analyzer import StressAssessment, assess_region
-from api_clients import REGIONS_BY_CODE, Region, RegionSnapshot, fetch_region_snapshot
+from api_clients import (
+    REGIONS_BY_CODE, FeedBundle, Region, RegionSnapshot, fetch_feeds,
+)
 
 __all__ = ["LoadResult", "load_region", "CACHE_TTL_SECONDS"]
 
-#: How long a successful fetch is reused before the next one is attempted.
-CACHE_TTL_SECONDS = 600
+#: Feeds that change fast (minutes-hours): re-fetched on every timed refresh.
+DYNAMIC_FEEDS = ("buoy", "sea_state")
+#: Feeds that are stable within a day: fetched roughly once per UTC day.
+CONTEXT_FEEDS = ("climatology", "obis", "infrastructure")
+
+#: TTLs matched to volatility.
+DYNAMIC_TTL = 600            # 10 minutes
+CONTEXT_TTL = 86_400         # 24 hours (the date key does the real invalidation)
+
+#: Back-compat alias — the dynamic tier's TTL is the "freshness" the UI tracks.
+CACHE_TTL_SECONDS = DYNAMIC_TTL
+
+#: A composed result is only stored as last-known-good when it carries real
+#: data, so an all-empty outage result never overwrites a good one on disk.
+_MIN_SOURCES_TO_PERSIST = 2
 
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 
@@ -148,19 +180,68 @@ def _restore(region_code: str) -> tuple[RegionSnapshot, StressAssessment] | None
 
 
 # --------------------------------------------------------------------------- #
-# Fetch
+# Fetch — two volatility tiers, cached independently
 # --------------------------------------------------------------------------- #
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=32)
-def _fetch(
-    _region: Region, cache_key: tuple[str, int]
-) -> tuple[RegionSnapshot, StressAssessment]:
-    """Live fetch + score. Cached by ``cache_key``; ``_region`` is excluded from
-    the hash (leading underscore) because it is the same for a given code.
-    ``cache_key`` is ``(region.code, nonce)`` — nonce forces a bypass on manual
-    refresh.
+@st.cache_data(ttl=DYNAMIC_TTL, show_spinner=False, max_entries=64)
+def _fetch_dynamic(_region: Region, cache_key: tuple[str, int]) -> FeedBundle:
+    """Fast-changing feeds (buoy + model SST). ``cache_key`` is ``(code, nonce)``
+    so REFRESH re-pulls them; ``_region`` is excluded from the hash by its
+    leading underscore."""
+    return asyncio.run(fetch_feeds(_region, DYNAMIC_FEEDS))
+
+
+@st.cache_data(ttl=CONTEXT_TTL, show_spinner=False, max_entries=64)
+def _fetch_context(_region: Region, cache_key: tuple[str, str]) -> FeedBundle:
+    """Slowly-changing feeds (OISST baseline + OBIS + infrastructure).
+    ``cache_key`` is ``(code, UTC-date)`` — the date changes daily and drives
+    invalidation; the long TTL is a memory-bound backstop. Deliberately not
+    keyed by nonce: REFRESH refreshes live conditions, not the stable baseline.
     """
-    snapshot = asyncio.run(fetch_region_snapshot(_region))
+    return asyncio.run(fetch_feeds(_region, CONTEXT_FEEDS))
+
+
+def _compose(
+    region: Region, dynamic: FeedBundle, context: FeedBundle
+) -> tuple[RegionSnapshot, StressAssessment]:
+    """Merge the two tiers into one RegionSnapshot and score it.
+
+    ``fetched_at`` and the wall-clock duration reflect the *live* tier — the
+    context tier usually comes from cache and did not run this cycle. Telemetry
+    from both tiers is merged and time-ordered, so the console honestly shows
+    each feed's last request with its real timestamp (the baseline's hours ago,
+    the buoy's seconds ago).
+    """
+    now = datetime.now(timezone.utc)
+    context_ran_now = (now - context.fetched_at).total_seconds() < 30.0
+    duration = dynamic.duration_ms + (context.duration_ms if context_ran_now else 0.0)
+    telemetry = sorted(
+        [*context.telemetry, *dynamic.telemetry], key=lambda e: e.started_at
+    )
+    snapshot = RegionSnapshot(
+        region=region,
+        fetched_at=dynamic.fetched_at,
+        duration_ms=duration,
+        obis=context.obis,
+        sea_state=dynamic.sea_state,
+        buoy=dynamic.buoy,
+        climatology=context.climatology,
+        infrastructure=context.infrastructure,
+        errors={**context.errors, **dynamic.errors},
+        telemetry=telemetry,
+    )
     return snapshot, assess_region(snapshot)
+
+
+def _remember(code: str, snapshot: RegionSnapshot, assessment: StressAssessment) -> None:
+    """Store as last-known-good (memory + disk), bounded, and only when the
+    result actually carries data — so an outage never poisons the cache."""
+    if assessment.score is None and snapshot.sources_ok < _MIN_SOURCES_TO_PERSIST:
+        return
+    _LAST_GOOD.pop(code, None)  # re-insert at end for true LRU eviction
+    _LAST_GOOD[code] = (snapshot, assessment)
+    while len(_LAST_GOOD) > MAX_CACHED_LOCATIONS:
+        _LAST_GOOD.pop(next(iter(_LAST_GOOD)))
+    _persist(code, snapshot, assessment)
 
 
 def load_region(region: Region | str, nonce: int = 0) -> LoadResult:
@@ -171,22 +252,20 @@ def load_region(region: Region | str, nonce: int = 0) -> LoadResult:
     locations flow through the same caching, persistence and fallback path as
     the built-in regions.
 
-    A partial fetch (some sources down) still counts as success — the analyzer
-    redistributes weights and reports the degradation. Only a total failure to
-    produce a snapshot falls back to cached data.
+    The dynamic and context tiers are fetched (or served from cache) and
+    composed. A partial fetch (some sources down) still counts as success — the
+    analyzer redistributes weights and reports the degradation. Only a total
+    failure to produce a snapshot falls back to cached data.
     """
     resolved = REGIONS_BY_CODE[region] if isinstance(region, str) else region
     code = resolved.code
+    day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     try:
-        snapshot, assessment = _fetch(resolved, (code, nonce))
-        # Re-insert at the end (dict preserves insertion order) so the bound
-        # below evicts genuinely least-recently-stored locations.
-        _LAST_GOOD.pop(code, None)
-        _LAST_GOOD[code] = (snapshot, assessment)
-        while len(_LAST_GOOD) > MAX_CACHED_LOCATIONS:
-            _LAST_GOOD.pop(next(iter(_LAST_GOOD)))
-        _persist(code, snapshot, assessment)
+        dynamic = _fetch_dynamic(resolved, (code, nonce))
+        context = _fetch_context(resolved, (code, day_key))
+        snapshot, assessment = _compose(resolved, dynamic, context)
+        _remember(code, snapshot, assessment)
         return LoadResult(snapshot, assessment, "live")
     except Exception as exc:
         reason = f"{type(exc).__name__}: {exc}"

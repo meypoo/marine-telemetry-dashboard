@@ -222,10 +222,13 @@ def _resilience_tests() -> None:
         return
     print(f"[ OK ] live load (origin={good.origin}, score={good.assessment.score})")
 
-    original = data_access._fetch
-    data_access._fetch = lambda _r, _k: (_ for _ in ()).throw(
-        RuntimeError("simulated upstream outage")
-    )
+    # Simulate a total outage by making both cache tiers raise.
+    def _boom(_r, _k):
+        raise RuntimeError("simulated upstream outage")
+
+    orig_dyn, orig_ctx = data_access._fetch_dynamic, data_access._fetch_context
+    data_access._fetch_dynamic = _boom
+    data_access._fetch_context = _boom
     try:
         degraded = load_region("MTBY", 999)
         if not degraded.ok or not degraded.stale:
@@ -257,7 +260,8 @@ def _resilience_tests() -> None:
         else:
             print("[ OK ] STALE banner shown, dashboard populated")
     finally:
-        data_access._fetch = original
+        data_access._fetch_dynamic = orig_dyn
+        data_access._fetch_context = orig_ctx
 
 
 if __name__ == "__main__":

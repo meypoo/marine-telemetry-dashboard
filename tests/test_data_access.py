@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import data_access  # noqa: E402
-from analyzer import StressAssessment  # noqa: E402
-from api_clients import Region, RegionSnapshot  # noqa: E402
+from analyzer import StressAssessment, assess_region  # noqa: E402
+from api_clients import (  # noqa: E402
+    BuoySnapshot, ClimatologySnapshot, FeedBundle, InfrastructureSnapshot,
+    ObisSnapshot, Region, RegionSnapshot, SeaStateSnapshot,
+)
 
 
 def _make(code_name: str) -> tuple[RegionSnapshot, StressAssessment]:
@@ -82,11 +85,59 @@ def test_restore_missing_returns_none() -> None:
     _with_temp_cache(body)
 
 
+def test_compose_merges_tiers_and_times() -> None:
+    """The two volatility tiers compose into one snapshot; wall clock and
+    fetched_at reflect the live (dynamic) tier, not the cached context tier."""
+    region = Region.from_point("Compose", 36.8, -121.9)
+    now = datetime.now(timezone.utc)
+    dynamic = FeedBundle(
+        sea_state=SeaStateSnapshot(latitude=36.8, longitude=-121.9, sst_c=[15.0]),
+        buoy=BuoySnapshot(status="live", water_temp_c=15.1),
+        duration_ms=5_000.0, fetched_at=now,
+    )
+    context = FeedBundle(
+        climatology=ClimatologySnapshot(observations=100, baseline_mean=14.0,
+                                        baseline_std=0.5, years_covered=10),
+        obis=ObisSnapshot(records=100, species=10, taxa=10, datasets=1,
+                          species_level_records=50, year_min=2000, year_max=2024),
+        infrastructure=InfrastructureSnapshot(total_count=5, area_km2=1000.0),
+        duration_ms=70_000.0, fetched_at=now - timedelta(hours=3),  # cached
+    )
+    snap, _ = data_access._compose(region, dynamic, context)
+
+    assert snap.sea_state is dynamic.sea_state and snap.buoy is dynamic.buoy
+    assert snap.climatology is context.climatology
+    assert snap.obis is context.obis and snap.infrastructure is context.infrastructure
+    assert snap.sources_ok == 5
+    assert snap.fetched_at == now, "fetched_at should track the live tier"
+    # Context ran 3h ago, so it is not counted in this cycle's wall clock.
+    assert abs(snap.duration_ms - 5_000.0) < 1e-6
+
+
+def test_remember_skips_empty_result() -> None:
+    """An all-empty outage result must not overwrite last-known-good on disk."""
+    def body(_: Path) -> None:
+        region = Region.from_point("Empty", 0.0, 0.0)
+        empty = RegionSnapshot(region=region, fetched_at=datetime.now(timezone.utc),
+                               duration_ms=0.0)  # every feed None
+        assessment = assess_region(empty)  # score is None
+        assert assessment.score is None and empty.sources_ok == 0
+
+        data_access._LAST_GOOD.pop("Empty", None)
+        data_access._remember("Empty", empty, assessment)
+        assert "Empty" not in data_access._LAST_GOOD, "empty result poisoned memory"
+        assert data_access._restore("Empty") is None, "empty result poisoned disk"
+
+    _with_temp_cache(body)
+
+
 ALL = [
     test_persist_restore_roundtrip,
     test_atomic_write_leaves_no_temp_files,
     test_eviction_caps_location_count,
     test_restore_missing_returns_none,
+    test_compose_merges_tiers_and_times,
+    test_remember_skips_empty_result,
 ]
 
 

@@ -49,6 +49,9 @@ __all__ = [
     "ClimatologySnapshot",
     "InfrastructureSnapshot",
     "RegionSnapshot",
+    "FeedBundle",
+    "FEED_NAMES",
+    "fetch_feeds",
     "fetch_region_snapshot",
 ]
 
@@ -1178,18 +1181,52 @@ class RegionSnapshot(BaseModel):
         return "full" if buoy_ok else "model_only"
 
 
-async def fetch_region_snapshot(
+#: All five source feeds, in fetch order.
+FEED_NAMES: Final[tuple[str, ...]] = (
+    "obis", "sea_state", "buoy", "climatology", "infrastructure"
+)
+
+
+class FeedBundle(BaseModel):
+    """The result of fetching a subset of feeds: the feed objects plus the
+    provenance (errors, telemetry, timing) for exactly what was fetched.
+
+    Feeds age at very different rates, so the dashboard caches them in
+    volatility tiers and composes a :class:`RegionSnapshot` from more than one
+    bundle (see ``data_access``). Every field is picklable so a bundle can live
+    in Streamlit's cache.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    obis: ObisSnapshot | None = None
+    sea_state: SeaStateSnapshot | None = None
+    buoy: BuoySnapshot | None = None
+    climatology: ClimatologySnapshot | None = None
+    infrastructure: InfrastructureSnapshot | None = None
+    feeds_requested: list[str] = Field(default_factory=list)
+    errors: dict[str, str] = Field(default_factory=dict)
+    telemetry: list[TelemetryEvent] = Field(default_factory=list)
+    duration_ms: float = 0.0
+    fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+async def fetch_feeds(
     region: Region,
+    feeds: Sequence[str],
     *,
     baseline_years: int = 10,
     window_days: int = 10,
     timeout: float = 120.0,
-) -> RegionSnapshot:
-    """Fetch all five source feeds for a region concurrently.
+) -> FeedBundle:
+    """Fetch the named feeds concurrently under one client, isolating failures.
 
-    Each feed is isolated: one source failing degrades the assessment rather
-    than aborting it, and the reason is preserved in ``errors``.
+    Only the requested feeds are fetched, so a caller can refresh the
+    fast-changing feeds (buoy, model SST) without re-pulling the slow ones (the
+    OISST baseline, biodiversity, infrastructure). Each feed degrades
+    independently; the reason is preserved in ``errors``.
     """
+    wanted = [f for f in FEED_NAMES if f in set(feeds)]
     sink = TelemetrySink()
     started = datetime.now(timezone.utc)
     t0 = time.perf_counter()
@@ -1209,32 +1246,68 @@ async def fetch_region_snapshot(
         # saying it is busy, so this client retries less and fails over sooner.
         overpass = OverpassClient(client, sink, max_attempts=2)
 
+        # Factories (not coroutines) so unrequested feeds are never created.
+        factories = {
+            "obis": lambda: obis.fetch(region),
+            "sea_state": lambda: marine.fetch(region),
+            "buoy": lambda: erddap.fetch_buoy(region),
+            "climatology": lambda: erddap.fetch_climatology(
+                region, years=baseline_years, window_days=window_days
+            ),
+            "infrastructure": lambda: overpass.fetch(region),
+        }
         results = await asyncio.gather(
-            obis.fetch(region),
-            marine.fetch(region),
-            erddap.fetch_buoy(region),
-            erddap.fetch_climatology(region, years=baseline_years, window_days=window_days),
-            overpass.fetch(region),
-            return_exceptions=True,
+            *(factories[name]() for name in wanted), return_exceptions=True
         )
 
-    names = ("obis", "sea_state", "buoy", "climatology", "infrastructure")
-    payload: dict[str, Any] = {}
+    values: dict[str, Any] = {}
     errors: dict[str, str] = {}
-    for name, outcome in zip(names, results):
+    for name, outcome in zip(wanted, results):
         if isinstance(outcome, BaseException):
             errors[name] = f"{type(outcome).__name__}: {outcome}"
-            payload[name] = None
+            values[name] = None
         else:
-            payload[name] = outcome
+            values[name] = outcome
 
-    return RegionSnapshot(
-        region=region,
-        fetched_at=started,
-        duration_ms=(time.perf_counter() - t0) * 1000.0,
+    return FeedBundle(
+        feeds_requested=wanted,
         errors=errors,
         telemetry=sink.events,
-        **payload,
+        duration_ms=(time.perf_counter() - t0) * 1000.0,
+        fetched_at=started,
+        **values,
+    )
+
+
+async def fetch_region_snapshot(
+    region: Region,
+    *,
+    baseline_years: int = 10,
+    window_days: int = 10,
+    timeout: float = 120.0,
+) -> RegionSnapshot:
+    """Fetch all five source feeds for a region concurrently and compose them.
+
+    Thin wrapper over :func:`fetch_feeds` requesting every feed at once. The
+    dashboard's caching layer fetches feeds in volatility tiers instead (see
+    ``data_access``); this single-shot form is what the standalone CLIs and
+    tests use, and its behaviour is unchanged.
+    """
+    bundle = await fetch_feeds(
+        region, FEED_NAMES,
+        baseline_years=baseline_years, window_days=window_days, timeout=timeout,
+    )
+    return RegionSnapshot(
+        region=region,
+        fetched_at=bundle.fetched_at,
+        duration_ms=bundle.duration_ms,
+        obis=bundle.obis,
+        sea_state=bundle.sea_state,
+        buoy=bundle.buoy,
+        climatology=bundle.climatology,
+        infrastructure=bundle.infrastructure,
+        errors=bundle.errors,
+        telemetry=bundle.telemetry,
     )
 
 
