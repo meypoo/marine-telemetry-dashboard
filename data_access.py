@@ -18,6 +18,7 @@ the LIVE/STALE indicator, and ``error`` carries the reason the refresh failed.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -80,14 +81,52 @@ def _paths(region_code: str) -> tuple[Path, Path]:
     )
 
 
+#: Cap on the number of distinct locations mirrored to disk. Searched locations
+#: are user-driven and otherwise unbounded, so the oldest are evicted once this
+#: many exist. Comfortably above the seven curated regions.
+MAX_CACHED_LOCATIONS = 100
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a temp file + os.replace so a concurrent reader never sees a
+    half-written file. os.replace is atomic on the same filesystem."""
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _evict_old(keep: int = MAX_CACHED_LOCATIONS) -> None:
+    """Keep only the ``keep`` most recently written locations. Best-effort."""
+    try:
+        snaps = sorted(
+            CACHE_DIR.glob("last_good_*_snapshot.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in snaps[keep:]:
+            stale.unlink(missing_ok=True)
+            assess = stale.with_name(
+                stale.name.replace("_snapshot.json", "_assessment.json")
+            )
+            assess.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _persist(region_code: str, snapshot: RegionSnapshot,
              assessment: StressAssessment) -> None:
-    """Mirror a good result to disk. Never raises — persistence is best-effort."""
+    """Mirror a good result to disk. Never raises — persistence is best-effort.
+
+    Writes are atomic (temp + replace) so a concurrent ``_restore`` cannot read
+    a partial file, and the location count is capped so user-driven searches do
+    not grow the cache without bound.
+    """
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         snap_path, assess_path = _paths(region_code)
-        snap_path.write_text(snapshot.model_dump_json(), encoding="utf-8")
-        assess_path.write_text(assessment.model_dump_json(), encoding="utf-8")
+        _atomic_write(snap_path, snapshot.model_dump_json())
+        _atomic_write(assess_path, assessment.model_dump_json())
+        _evict_old()
     except Exception:
         pass
 
@@ -141,7 +180,12 @@ def load_region(region: Region | str, nonce: int = 0) -> LoadResult:
 
     try:
         snapshot, assessment = _fetch(resolved, (code, nonce))
+        # Re-insert at the end (dict preserves insertion order) so the bound
+        # below evicts genuinely least-recently-stored locations.
+        _LAST_GOOD.pop(code, None)
         _LAST_GOOD[code] = (snapshot, assessment)
+        while len(_LAST_GOOD) > MAX_CACHED_LOCATIONS:
+            _LAST_GOOD.pop(next(iter(_LAST_GOOD)))
         _persist(code, snapshot, assessment)
         return LoadResult(snapshot, assessment, "live")
     except Exception as exc:

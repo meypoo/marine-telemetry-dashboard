@@ -61,6 +61,9 @@ __all__ = [
 # Limits and thresholds
 # --------------------------------------------------------------------------- #
 MAX_ROWS: Final[int] = 500_000
+#: Hard byte cap enforced before parsing, so an oversized upload is rejected
+#: without first being materialised into memory.
+MAX_UPLOAD_BYTES: Final[int] = 75 * 1_048_576  # 75 MB
 MIN_POINTS_TREND: Final[int] = 8
 MIN_POINTS_SEASONALITY: Final[int] = 24
 MIN_POINTS_MULTIVARIATE: Final[int] = 20
@@ -150,9 +153,20 @@ def read_uploaded(filename: str, payload: bytes) -> pd.DataFrame:
     if not payload:
         raise ValueError("uploaded file is empty")
 
+    # Guard on raw size *before* parsing, so an oversized file is rejected
+    # rather than being fully materialised into memory first. Streamlit's
+    # maxUploadSize (config.toml) is the outer bound; this is the analysis bound.
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"file is {len(payload) / 1_048_576:.0f} MB; the limit is "
+            f"{MAX_UPLOAD_BYTES // 1_048_576} MB. Aggregate or subset before uploading."
+        )
+
+    # Read at most MAX_ROWS + 1 so the over-limit check below still fires while
+    # never materialising an unbounded number of rows.
     if suffix in {"xlsx", "xls"}:
         try:
-            frame = pd.read_excel(io.BytesIO(payload))
+            frame = pd.read_excel(io.BytesIO(payload), nrows=MAX_ROWS + 1)
         except ImportError as exc:
             raise ValueError(
                 "Excel support needs the 'openpyxl' package (pip install openpyxl); "
@@ -164,7 +178,9 @@ def read_uploaded(filename: str, payload: bytes) -> pd.DataFrame:
         text = payload.decode("utf-8-sig", errors="replace")
         try:
             # sep=None lets the sniffer handle comma/tab/semicolon exports.
-            frame = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+            frame = pd.read_csv(
+                io.StringIO(text), sep=None, engine="python", nrows=MAX_ROWS + 1
+            )
         except Exception as exc:
             raise ValueError(f"could not parse delimited text: {exc}") from exc
 
@@ -172,7 +188,7 @@ def read_uploaded(filename: str, payload: bytes) -> pd.DataFrame:
         raise ValueError("file parsed but contains no rows")
     if len(frame) > MAX_ROWS:
         raise ValueError(
-            f"file has {len(frame):,} rows; the limit is {MAX_ROWS:,}. "
+            f"file exceeds the {MAX_ROWS:,}-row limit. "
             "Aggregate or subset before uploading."
         )
     frame.columns = [str(c).strip() for c in frame.columns]

@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile all modules
+        run: python -m compileall -q *.py
+
+      - name: Run offline test suite
+        # The live suite (test_app.py) hits public APIs and drives the Streamlit
+        # runtime; it is deliberately excluded from CI. The offline suite carries
+        # the seasonal-confounding regression guard and is deterministic.
+        run: python tests/run_all.py --offline

@@ -22,7 +22,10 @@ gatherUsageStats = false
 
 [client]
 toolbarMode = "minimal"
-showErrorDetails = true
+# Public-facing: do not leak raw tracebacks to end users. The app surfaces its
+# own friendly error states (RENDER ERROR / DATA UNAVAILABLE / STALE banners),
+# and logs/ has the detail for the operator. Set to "full" to debug locally.
+showErrorDetails = "none"
 
 [runner]
 fastReruns = true

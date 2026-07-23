@@ -49,6 +49,17 @@ function Write-Log {
 Write-Log "supervisor starting; project=$projectRoot port=$Port"
 Write-Log "dashboard will be at http://localhost:$Port  (Ctrl+C to stop)"
 
+function Remove-OldLogs {
+    param([int]$Keep = 40)
+    # Each launch writes a timestamped out/err pair; keep only the newest $Keep.
+    try {
+        Get-ChildItem -Path $LogDir -Filter "streamlit-*.log" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip $Keep |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 $restarts = 0
 $stopping = $false
 
@@ -58,6 +69,7 @@ try {
 } catch { }
 
 while (-not $stopping) {
+    Remove-OldLogs
     $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
     $outLog = Join-Path $LogDir "streamlit-$stamp.out.log"
     $errLog = Join-Path $LogDir "streamlit-$stamp.err.log"

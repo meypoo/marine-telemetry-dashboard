@@ -132,6 +132,23 @@ def test_semicolon_delimiter_sniffed() -> None:
     assert "temperature_c" in profile.numeric_columns
 
 
+def test_oversized_upload_rejected_before_parse() -> None:
+    """An oversized payload is rejected on byte count, not parsed into memory."""
+    import ml_analysis
+
+    original = ml_analysis.MAX_UPLOAD_BYTES
+    ml_analysis.MAX_UPLOAD_BYTES = 100
+    try:
+        raised = False
+        try:
+            ml_analysis.read_uploaded("big.csv", b"col\n" + b"1\n" * 500)
+        except ValueError as exc:
+            raised = "limit" in str(exc).lower()
+        assert raised, "oversized upload should raise ValueError mentioning the limit"
+    finally:
+        ml_analysis.MAX_UPLOAD_BYTES = original
+
+
 ALL = [
     test_known_truth_recovery,
     test_ph_trend_recovered,
@@ -140,6 +157,7 @@ ALL = [
     test_arbitrary_numeric_columns_are_analysed,
     test_edge_cases_degrade_cleanly,
     test_semicolon_delimiter_sniffed,
+    test_oversized_upload_rejected_before_parse,
 ]
 
 
