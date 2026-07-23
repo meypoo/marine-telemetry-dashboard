@@ -24,9 +24,7 @@ from ui import (
     SOURCE_COLOURS, TerminalConfig, esc, fmt,
 )
 
-__all__ = ["render_topbar_left", "render_body", "render_footer"]
-
-SUBTITLE = "Live environmental risk telemetry · Central Coast, California"
+__all__ = ["render_topbar_left", "location_subtitle", "render_body", "render_footer"]
 SOURCES_LINE = (
     "SOURCES: NOAA ERDDAP coastwatch.pfeg.noaa.gov (cwwcNDBCMet in-situ buoy, "
     "ncdcOisst21Agg OISST v2.1 day-of-year baseline) · Open-Meteo Marine "
@@ -211,14 +209,27 @@ def _hbars(
 # --------------------------------------------------------------------------- #
 # Top bar / footer
 # --------------------------------------------------------------------------- #
-def render_topbar_left(config: TerminalConfig) -> str:
+def render_topbar_left(config: TerminalConfig, subtitle: str, stamp: str) -> str:
+    """Title block: fixed product name over a location-specific subtitle and the
+    UTC timestamp. The title never wraps (nowrap) so a narrow column cannot
+    shatter it across several lines."""
     return (
-        f'<div style="padding:{config.pad_outer}px 0 {config.pad_outer}px 32px">'
-        f'<div><span class="tm-live"></span>'
-        f'<span class="tm-title">MARINE ECOSYSTEM HEALTH INDEX</span></div>'
-        f'<div class="tm-subtitle">{esc(SUBTITLE)}</div>'
+        f'<div style="padding:{config.pad_outer}px 0 16px 32px">'
+        '<div style="white-space:nowrap"><span class="tm-live"></span>'
+        '<span class="tm-title">MARINE ECOSYSTEM HEALTH INDEX</span></div>'
+        f'<div class="tm-subtitle">{esc(subtitle)}</div>'
+        f'<div class="tm-stamp" style="margin-top:3px;line-height:1.4">{esc(stamp)}</div>'
         "</div>"
     )
+
+
+def location_subtitle(region: Region, coverage: str) -> str:
+    """Subtitle reflecting the current location and its data coverage."""
+    tail = {
+        "none": " · no marine data here",
+        "model_only": " · model-only SST",
+    }.get(coverage, "")
+    return f"Live environmental risk telemetry · {region.name}{tail}"
 
 
 def render_footer() -> str:

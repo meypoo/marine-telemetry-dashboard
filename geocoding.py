@@ -27,7 +27,31 @@ from typing import Final
 import httpx
 from pydantic import BaseModel
 
-__all__ = ["GeocodeResult", "geocode", "parse_latlon", "GeocodingError"]
+__all__ = [
+    "GeocodeResult", "geocode", "parse_latlon", "marine_query_variants",
+    "GeocodingError",
+]
+
+_WATER_NOUNS: Final[str] = (
+    "bay|gulf|sea|strait|sound|lagoon|reef|cove|fjord|bight|estuary|channel"
+)
+_WATER_OF_RE = re.compile(rf"^({_WATER_NOUNS})\s+of\s+(.+)$", re.IGNORECASE)
+
+
+def marine_query_variants(query: str) -> list[str]:
+    """Canonical re-phrasings of a water-body query, for a fallback lookup.
+
+    Nominatim matches "bay of tokyo" against restaurants named "Little Tokyo"
+    rather than the actual Tokyo Bay, because that word order is not how the
+    feature is named. Rewriting "<water> of <place>" to "<place> <water>"
+    ("tokyo bay") surfaces the real feature. Returns an empty list when the
+    query is not of that shape.
+    """
+    match = _WATER_OF_RE.match(query.strip())
+    if not match:
+        return []
+    noun, place = match.group(1).lower(), match.group(2).strip()
+    return [f"{place} {noun}"]
 
 NOMINATIM_URL: Final[str] = "https://nominatim.openstreetmap.org/search"
 USER_AGENT: Final[str] = (
@@ -62,14 +86,28 @@ class GeocodeResult(BaseModel):
 
     @property
     def looks_marine(self) -> bool:
-        """Heuristic: does OSM classify this as a water feature?"""
+        """Broad heuristic: is this a water/coastal feature? (cosmetic tag only)."""
         marine_kinds = {
             "sea", "bay", "ocean", "strait", "gulf", "sound", "channel",
             "lagoon", "reef", "cape", "water", "wetland", "beach", "shoal",
+            "cove", "fjord", "bight", "estuary",
         }
         return (self.kind or "").lower() in marine_kinds or (
             self.category or ""
         ).lower() in {"natural", "water", "waterway"}
+
+    @property
+    def is_sea_feature(self) -> bool:
+        """Strict: an actual sea/ocean water body, used to rank search results.
+
+        Excludes generic ``water``/``lake`` (freshwater), and land features like
+        ``cape``/``beach``, so "Tokyo Bay" outranks "Little Tokyo" but a
+        lake never outranks a coastal city.
+        """
+        return (self.kind or "").lower() in {
+            "sea", "bay", "ocean", "strait", "gulf", "sound", "channel",
+            "lagoon", "reef", "shoal", "cove", "fjord", "bight", "estuary",
+        }
 
 
 # --------------------------------------------------------------------------- #

@@ -24,7 +24,7 @@ For an unattended run that restarts itself if the process dies:
 
 ## The two views
 
-**Live Index** (`/live`) — the stress score for one of seven curated regions or
+**Live Index** (`/`) — the stress score for one of seven curated regions or
 **any location you search** (a place name, or a raw `lat, lon` pair for offshore
 points the geocoder can't place). The score blends three independently computed,
 independently degradable components:

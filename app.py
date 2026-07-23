@@ -38,9 +38,13 @@ from ui import TerminalConfig, inject_base_css  # noqa: E402  (must follow set_p
 
 inject_base_css(TerminalConfig.from_query_params())
 
+# The default page is served at "/" (Streamlit does not also serve it at a
+# custom url_path — navigating to "/live" would raise a "page not found"
+# dialog), so the Live Index deliberately has no url_path: it lives at "/".
+# The Data Lab is at "/lab".
 navigation = st.navigation(
     [
-        st.Page("page_live.py", title="LIVE INDEX", url_path="live", default=True),
+        st.Page("page_live.py", title="LIVE INDEX", default=True),
         st.Page("page_lab.py", title="DATA LAB", url_path="lab"),
     ],
     position="hidden",

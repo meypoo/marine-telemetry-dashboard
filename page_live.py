@@ -22,8 +22,12 @@ import streamlit as st
 
 from api_clients import REGIONS, Region
 from data_access import CACHE_TTL_SECONDS, load_region
-from geocoding import GeocodeResult, GeocodingError, geocode, parse_latlon
-from terminal_render import render_body, render_footer, render_topbar_left
+from geocoding import (
+    GeocodeResult, GeocodingError, geocode, marine_query_variants, parse_latlon,
+)
+from terminal_render import (
+    location_subtitle, render_body, render_footer, render_topbar_left,
+)
 from ui import (
     CANOPY, LINE, PAPER_DIM, SIGNAL, TerminalConfig, esc,
     inject_terminal_css, safe_page_link,
@@ -43,8 +47,11 @@ if "nonce" not in st.session_state:
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=128)
 def _geocode_cached(query: str) -> list[GeocodeResult]:
-    """Cached place-name lookup. Respects Nominatim's rate limit only on a miss."""
-    return geocode(query)
+    """Cached place-name lookup. Respects Nominatim's rate limit only on a miss.
+
+    Fetches several candidates so the resolver can prefer a sea feature over a
+    same-name land feature."""
+    return geocode(query, limit=10)
 
 
 def _resolve_location(
@@ -71,6 +78,12 @@ def _resolve_location(
             f"raw coordinates {lat:.3f}, {lon:.3f}",
         )
 
+    def _sea_first(rs: list[GeocodeResult]) -> list[GeocodeResult]:
+        return sorted(
+            (r for r in rs if r.is_sea_feature),
+            key=lambda r: r.importance or 0.0, reverse=True,
+        )
+
     try:
         results = _geocode_cached(text)
     except GeocodingError as exc:
@@ -79,9 +92,30 @@ def _resolve_location(
     if not results:
         return curated, "nomatch", f"no location matched “{text}”; showing {curated.name}"
 
-    best = results[0]
-    marine = " · marine feature" if best.looks_marine else ""
-    note = f"{best.short_name} → {best.latitude:.3f}, {best.longitude:.3f}{marine}"
+    # Prefer an actual sea/ocean water body over a same-name land feature, so a
+    # lake or coastal district never outranks a sea feature (is_sea_feature is
+    # strict). If the raw query surfaces no water body but is phrased like a
+    # water body ("bay of tokyo"), retry the canonical phrasing ("tokyo bay")
+    # before falling back to the top overall result.
+    matched_via: str | None = None
+    sea = _sea_first(results)
+    if not sea:
+        for variant in marine_query_variants(text):
+            try:
+                alt = _geocode_cached(variant)
+            except GeocodingError:
+                continue
+            alt_sea = _sea_first(alt)
+            if alt_sea:
+                results, sea, matched_via = alt, alt_sea, variant
+                break
+
+    best = sea[0] if sea else results[0]
+    tag = " · water body" if best.is_sea_feature else (
+        " · marine feature" if best.looks_marine else " · inland"
+    )
+    via = f" (matched “{matched_via}”)" if matched_via else ""
+    note = f"{best.short_name} → {best.latitude:.3f}, {best.longitude:.3f}{tag}{via}"
     return Region.from_point(best.short_name, best.latitude, best.longitude), "search", note
 
 
@@ -120,19 +154,16 @@ def terminal() -> None:
 def _render() -> None:
     now = datetime.now(timezone.utc)
 
-    title_col, nav_col, search_col, region_col, stamp_col, refresh_col = st.columns(
-        [0.28, 0.08, 0.24, 0.14, 0.14, 0.12]
+    # Controls are rendered first so their values are known; the title column is
+    # filled in last, once the location is resolved, so its subtitle can name it.
+    title_col, search_col, region_col, refresh_col, nav_col = st.columns(
+        [0.40, 0.24, 0.15, 0.11, 0.10]
     )
-    with title_col:
-        st.markdown(render_topbar_left(config), unsafe_allow_html=True)
-    with nav_col:
-        safe_page_link("page_live.py", "LIVE INDEX")
-        safe_page_link("page_lab.py", "DATA LAB")
     with search_col:
         search_text = st.text_input(
             "SEARCH",
             key="location_search",
-            placeholder="search place or lat, lon",
+            placeholder="place name or lat, lon",
             label_visibility="collapsed",
         )
     with region_col:
@@ -144,14 +175,20 @@ def _render() -> None:
     with refresh_col:
         if st.button("REFRESH", use_container_width=True):
             st.session_state.nonce += 1
+    with nav_col:
+        safe_page_link("page_live.py", "LIVE INDEX")
+        safe_page_link("page_lab.py", "DATA LAB")
 
     curated = next(r for r in REGIONS if r.name == selected_name)
     region, source, note = _resolve_location(search_text, curated)
     result = load_region(region, st.session_state.nonce)
+    coverage = result.snapshot.marine_coverage if result.ok else "unknown"
 
-    with stamp_col:
+    with title_col:
         st.markdown(
-            f'<div class="tm-stamp" style="text-align:right">{now:%Y-%m-%d %H:%M:%S}Z</div>',
+            render_topbar_left(
+                config, location_subtitle(region, coverage), f"{now:%Y-%m-%d %H:%M:%S}Z"
+            ),
             unsafe_allow_html=True,
         )
 
@@ -190,7 +227,7 @@ def _render() -> None:
         )
 
     # Coverage state: distinguish "no marine data here" from a transient failure.
-    coverage = result.snapshot.marine_coverage
+    # (coverage was computed above for the subtitle.)
     if coverage == "none":
         st.markdown(
             '<div class="tm-root"><div class="tm-main">'

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 pip install -r requirements.txt
 
-streamlit run app.py                            # dashboard on :8501 (/live and /lab)
+streamlit run app.py                            # dashboard on :8501 (Live Index at /, Data Lab at /lab)
 .\run_overnight.ps1                             # supervised launch; restarts if the process dies
 
 python tests/run_all.py                         # full suite (offline + live)

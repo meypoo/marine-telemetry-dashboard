@@ -139,6 +139,13 @@ def _base_css(config: TerminalConfig) -> str:
   #MainMenu, footer, [data-testid="stStatusWidget"] {{ visibility: hidden; height: 0; }}
   header[data-testid="stHeader"] {{ background: transparent; height: 0; }}
 
+  /* Consistent, tight page frame across pages. Streamlit's default block
+     container adds a large top gap (to clear the now-hidden header) and wide
+     side padding; the Data Lab uses this base sheet, so normalise it here. The
+     Live terminal overrides these to zero in its own sheet. */
+  .block-container {{ max-width: 1600px !important; margin: 0 auto;
+      padding: 16px 28px 48px 28px !important; }}
+
   div[data-testid="stVerticalBlock"] {{ gap: 0.35rem !important; }}
   div[data-testid="stHorizontalBlock"] {{ gap: 0.35rem !important; }}
   hr {{ border-color: {LINE}; margin: 0.35rem 0; }}
@@ -147,10 +154,17 @@ def _base_css(config: TerminalConfig) -> str:
   .stButton > button {{
       border: 1px solid {SIGNAL}; background: transparent; color: {SIGNAL};
       font-size: 12px; font-weight: 700; letter-spacing: 0.05em;
-      padding: 9px 20px; width: 100%;
+      padding: 9px 12px; width: 100%; white-space: nowrap;
   }}
+  /* Streamlit gives the button label an aggressive word-break; stop it breaking
+     "REFRESH" into vertical fragments in a narrow column. */
+  .stButton > button * {{ white-space: nowrap !important; word-break: keep-all !important;
+      overflow-wrap: normal !important; }}
   .stButton > button:hover {{ background: rgba(228,179,74,0.12); color: {SIGNAL}; }}
   .stButton > button:focus {{ box-shadow: none; color: {SIGNAL}; }}
+
+  /* Inputs fill their column. */
+  [data-testid="stTextInput"] input {{ width: 100%; }}
 
   div[data-baseweb="select"] > div {{
       background: transparent !important; border: 1px solid {BORDER_STRONG} !important;
@@ -170,6 +184,10 @@ def _base_css(config: TerminalConfig) -> str:
 
   section[data-testid="stFileUploaderDropzone"] {{
       border: 1px dashed {CANOPY}; background: #16231b; padding: 8px;
+  }}
+  section[data-testid="stFileUploaderDropzone"] button,
+  section[data-testid="stFileUploaderDropzone"] button * {{
+      white-space: nowrap !important; word-break: keep-all !important;
   }}
   .stDataFrame {{ border: 1px solid {LINE}; }}
 
@@ -209,19 +227,24 @@ def _base_css(config: TerminalConfig) -> str:
 
 def _terminal_css(config: TerminalConfig) -> str:
     """Live Index frame. Injected after the base sheet so it wins."""
-    # The fixed 1920px frame is applied to Streamlit's own block container rather
-    # than an inner div: arbitrary HTML cannot wrap Streamlit widgets, and the
-    # top bar needs real controls (region select, refresh) inside the frame.
+    # The design width is 1920px, applied as a *max-width* (not a fixed/min
+    # width): at >=1920 it renders at full design size, and on a smaller screen
+    # it shrinks to fit instead of forcing the right-hand controls off-screen.
+    # Fluid mode removes the cap entirely.
     width_rule = (
-        "width: 100% !important; max-width: 100% !important;"
+        "max-width: 100% !important;"
         if config.fluid_width
-        else "width: 1920px !important; max-width: 1920px !important; min-width: 1920px;"
+        else "max-width: 1920px !important;"
     )
     return f"""
 <style>
-  .block-container {{ {width_rule} margin: 0 auto; padding: 0 !important; }}
+  .block-container {{ {width_rule} width: 100% !important; margin: 0 auto;
+      padding: 0 !important; }}
   div[data-testid="stVerticalBlock"] {{ gap: 0 !important; }}
-  div[data-testid="stHorizontalBlock"] {{ gap: 18px !important; align-items: center; }}
+  div[data-testid="stHorizontalBlock"] {{ gap: 14px !important; align-items: center;
+      flex-wrap: nowrap; }}
+  /* Keep the terminal usable down to a sensible desktop min before scrolling. */
+  section.main > div.block-container {{ min-width: 0; }}
 
   .tm-root {{ width: 100%; background: {INK}; color: {PAPER};
       font-family: {MONO}; font-size: 12px; }}
@@ -300,7 +323,7 @@ def _terminal_css(config: TerminalConfig) -> str:
   .tm-statrow .v {{ color: {PAPER}; font-weight: 500; text-align: right; }}
 
   /* --- console --- */
-  .tm-console {{ border-top: 1px solid {LINE}; padding-top: 16px; }}
+  .tm-console {{ border-top: 1px solid {LINE}; padding-top: 16px; overflow-x: auto; }}
   .tm-tiles {{ display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px;
       border-bottom: 1px solid {LINE}; padding-bottom: 14px; margin-bottom: 14px; }}
   .tm-tile .l {{ color: {SIGNAL}; font-size: 10px; letter-spacing: 0.10em; }}

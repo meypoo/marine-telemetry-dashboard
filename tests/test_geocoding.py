@@ -12,7 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from geocoding import GeocodingError, geocode, parse_latlon  # noqa: E402
+from geocoding import (  # noqa: E402
+    GeocodingError, geocode, marine_query_variants, parse_latlon,
+)
 
 
 def test_parse_decimal_pair() -> None:
@@ -40,6 +42,17 @@ def test_parse_out_of_range() -> None:
     assert parse_latlon("45.0, 200.0") is None
 
 
+def test_marine_query_variants() -> None:
+    # "<water> of <place>" is canonicalised to "<place> <water>".
+    assert marine_query_variants("bay of tokyo") == ["tokyo bay"]
+    assert marine_query_variants("Gulf of Mexico") == ["Mexico gulf"]
+    assert marine_query_variants("Strait of Gibraltar") == ["Gibraltar strait"]
+    # Non-water phrasings produce no variant.
+    assert marine_query_variants("Little Tokyo") == []
+    assert marine_query_variants("Monterey Bay") == []
+    assert marine_query_variants("Denver") == []
+
+
 def test_live_geocode() -> None:
     if os.environ.get("MEHI_LIVE_TESTS") != "1":
         print("      (skipped — set MEHI_LIVE_TESTS=1 to run the live lookup)")
@@ -58,6 +71,7 @@ ALL = [
     test_parse_hemisphere_letters,
     test_parse_rejects_non_coordinates,
     test_parse_out_of_range,
+    test_marine_query_variants,
     test_live_geocode,
 ]
 
