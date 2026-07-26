@@ -141,9 +141,16 @@ with sel_col:
         default=profile.numeric_columns[:8], label_visibility="collapsed",
     )
 with sens_col:
+    # Label left visible: collapsed, this reads as an unexplained control
+    # spanning "auto … 10%" with no indication of what it changes.
     sensitivity = st.select_slider(
         "ANOMALY SENSITIVITY", options=["auto", "1%", "2%", "5%", "10%"],
-        value="auto", label_visibility="collapsed",
+        value="auto",
+        help=(
+            "Expected share of rows the Isolation Forest should flag as "
+            "anomalous. 'auto' lets the model decide; a fixed percentage "
+            "forces that fraction."
+        ),
     )
 
 if not selected:

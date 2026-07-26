@@ -454,12 +454,19 @@ def render_structure(report: AnalysisReport) -> None:
             ]
             heat_df = pd.DataFrame(cells).dropna(subset=["rho"]) if cells else pd.DataFrame()
             if not heat_df.empty:
+                # Height must scale with the matrix, not be fixed: at a fixed
+                # 190px an 8-parameter matrix collapses into hairline stripes
+                # and Vega silently drops most of the y-axis labels. ~26px per
+                # row keeps every label readable and the cells square-ish.
+                n_cols = max(1, len(correlation.columns))
                 heat = (
                     alt.Chart(heat_df)
                     .mark_rect(stroke=LINE, strokeWidth=1)
                     .encode(
-                        x=alt.X("a:N", title=None),
-                        y=alt.Y("b:N", title=None),
+                        x=alt.X("a:N", title=None,
+                                axis=alt.Axis(labelAngle=-45)),
+                        y=alt.Y("b:N", title=None,
+                                axis=alt.Axis(labelLimit=140)),
                         color=alt.Color(
                             "rho:Q", title="Spearman",
                             # Amber for negative, canopy for positive: the same
@@ -469,7 +476,7 @@ def render_structure(report: AnalysisReport) -> None:
                         ),
                         tooltip=["a:N", "b:N", alt.Tooltip("rho:Q", format=".3f")],
                     )
-                    .properties(height=190)
+                    .properties(height=max(190, 26 * n_cols))
                 )
                 st.altair_chart(style_chart(heat), use_container_width=True)
 
@@ -557,12 +564,19 @@ def render_structure(report: AnalysisReport) -> None:
                 # redundant cue, reordered so the regimes seen first (k is
                 # usually 2-3) get the most distinct hues.
                 n_regimes = max(1, len(set(clusters.labels)))
+                # Its own titled block: the bordered heading separates the strip
+                # from the PCA loadings above it (they collided without it) and
+                # names what R1..Rn are, which the lanes alone do not say.
+                panel_title("REGIME MEMBERSHIP OVER SAMPLE ORDER")
                 strip = (
                     alt.Chart(regime_df)
                     .mark_tick(thickness=2, size=14)
                     .encode(
                         x=alt.X("sample:Q", title="sample order"),
-                        y=alt.Y("regime:N", title=None, sort="ascending"),
+                        y=alt.Y("regime:N", title=None, sort="ascending",
+                                # Every lane must be labelled; Vega silently
+                                # drops alternating labels when bands are tight.
+                                axis=alt.Axis(labelOverlap=False, labelPadding=6)),
                         color=alt.Color(
                             "regime:N", title="regime",
                             scale=alt.Scale(range=[SIGNAL, CANOPY, PAPER, MIST]),
@@ -570,7 +584,7 @@ def render_structure(report: AnalysisReport) -> None:
                         ),
                         tooltip=["sample:Q", "regime:N"],
                     )
-                    .properties(height=22 * n_regimes + 20)
+                    .properties(height=26 * n_regimes + 30)
                 )
                 st.altair_chart(style_chart(strip), use_container_width=True)
             st.markdown(
@@ -680,7 +694,7 @@ def render_inventory(profile: DatasetProfile) -> None:
 
 def render_footer(profile: DatasetProfile, report: AnalysisReport) -> None:
     st.markdown(
-        f'<div class="mx-sub" style="padding-top:6px">'
+        f'<div class="mx-footnote" style="padding-top:6px">'
         f"ANALYSIS: Theil-Sen + Mann-Kendall (serial-correlation adjusted) · "
         f"autocorrelation periodicity with seasonal adjustment · binary-segmentation "
         f"changepoints · IsolationForest · PCA · k-means (silhouette-selected k). "

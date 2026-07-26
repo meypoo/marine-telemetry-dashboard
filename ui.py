@@ -29,7 +29,7 @@ __all__ = [
     "SOURCE_COLOURS", "TerminalConfig",
     "inject_base_css", "inject_terminal_css",
     "metric_box", "panel_title", "kv_rows", "fmt", "style_chart", "command_bar",
-    "safe_page_link", "stress_accent", "esc", "gloss_attr",
+    "safe_page_link", "stress_accent", "esc", "gloss_attr", "bidi_isolate",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -184,11 +184,27 @@ def _base_css(config: TerminalConfig) -> str:
   }}
   div[data-baseweb="popover"] li:hover {{ background: {LINE} !important; }}
 
+  /* The active page's nav link carries a light background by default, which
+     renders as a white box on INK — and a rounded one. Colour alone was styled
+     here before; the background, radius and hover fill all need overriding. */
   a[data-testid="stPageLink-NavLink"] {{
       color: {MIST} !important; font-size: 11.5px; letter-spacing: 0.05em;
-      padding: 4px 0 !important;
+      padding: 4px 0 !important; background: transparent !important;
+      border-radius: 0 !important;
   }}
-  a[data-testid="stPageLink-NavLink"]:hover {{ color: {SIGNAL} !important; }}
+  a[data-testid="stPageLink-NavLink"]:hover,
+  a[data-testid="stPageLink-NavLink"]:focus,
+  a[data-testid="stPageLink-NavLink"]:active {{
+      color: {SIGNAL} !important; background: transparent !important;
+  }}
+  a[data-testid="stPageLink-NavLink"] * {{ background: transparent !important; }}
+
+  /* Widget labels that are deliberately left visible (e.g. ANOMALY
+     SENSITIVITY) should read as section labels, not as body prose. */
+  div[data-testid="stWidgetLabel"] p {{
+      color: {MIST} !important; font-size: 10px !important;
+      letter-spacing: 0.12em; text-transform: uppercase;
+  }}
 
   section[data-testid="stFileUploaderDropzone"] {{
       border: 1px dashed {CANOPY}; background: {PANEL}; padding: 8px;
@@ -218,15 +234,25 @@ def _base_css(config: TerminalConfig) -> str:
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }}
   .mx-value {{ font-size: 19px; font-weight: 700; line-height: 1.2; margin: 2px 0; }}
+  /* Metric-tile subtitle: one line in a narrow column, so it ellipsizes. */
   .mx-sub {{ color: {MIST}; font-size: 10.5px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  /* Footnote prose: full width and MUST wrap, never truncate — the Data Lab
+     footer carries the "parsed locally, not transmitted" statement, and an
+     ellipsis silently hid it. */
+  .mx-footnote {{ color: {MIST}; font-size: 10.5px; line-height: 1.5;
+      white-space: normal; }}
 
   .mx-panel-title {{
       color: {SIGNAL}; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
       border-bottom: 1px solid {LINE}; padding: 4px 0 3px 0; margin: 6px 0 4px 0;
   }}
   .mx-kv {{ font-size: 11.5px; line-height: 1.55; }}
-  .mx-kv .k {{ color: {MIST}; display: inline-block; min-width: 190px; }}
+  /* padding-right, not just min-width: a key longer than the column (e.g.
+     "temperature ~ dissolved_oxygen") otherwise butts straight into its value
+     with no separating space. border-box keeps short keys aligned at 190px. */
+  .mx-kv .k {{ color: {MIST}; display: inline-block; min-width: 190px;
+      padding-right: 14px; box-sizing: border-box; vertical-align: top; }}
   .mx-kv .v {{ color: {PAPER}; }}
   .mx-kv .w, .mx-kv .e {{ color: {SIGNAL}; }}
   .mx-kv .c {{ color: {CANOPY}; }}
@@ -477,6 +503,21 @@ GLOSSARY: dict[str, str] = {
     "contamination": "The expected fraction of anomalies, which sets the "
                      "Isolation Forest's flagging threshold.",
 }
+
+
+def bidi_isolate(text: str) -> str:
+    """Isolate a run of text from the surrounding bidirectional layout.
+
+    A geocoded place name can be right-to-left (Arabic, Hebrew, Persian), and an
+    un-isolated RTL run reorders the *neutral* text around it: a line built as
+    ``name → lat, lon`` renders with the coordinates visually transposed, which
+    reads as a completely different location. FSI/PDI are plain Unicode
+    characters, so unlike a ``<bdi>`` element they survive ``esc()`` and work
+    identically inside chips, banners and SVG ``title`` attributes.
+    """
+    if not text:
+        return text
+    return f"⁨{text}⁩"
 
 
 def gloss_attr(label: str) -> str:

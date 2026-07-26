@@ -33,7 +33,7 @@ from terminal_render import (
     render_footer, render_topbar_left,
 )
 from ui import (
-    CANOPY, LINE, PAPER_DIM, SIGNAL, TerminalConfig, esc,
+    CANOPY, LINE, PAPER_DIM, SIGNAL, TerminalConfig, bidi_isolate, esc,
     inject_terminal_css, safe_page_link,
 )
 
@@ -111,7 +111,9 @@ def _resolve_location(
         return curated, "error", f"geocoder unavailable ({exc}); showing {curated.name}"
 
     if not results:
-        return curated, "nomatch", f"no location matched “{text}”; showing {curated.name}"
+        return curated, "nomatch", (
+            f"no location matched “{bidi_isolate(text)}”; showing {curated.name}"
+        )
 
     # Prefer an actual sea/ocean water body over a same-name land feature, so a
     # lake or coastal district never outranks a sea feature (is_sea_feature is
@@ -135,8 +137,14 @@ def _resolve_location(
     tag = " · water body" if best.is_sea_feature else (
         " · marine feature" if best.looks_marine else " · inland"
     )
-    via = f" (matched “{matched_via}”)" if matched_via else ""
-    note = f"{best.short_name} → {best.latitude:.3f}, {best.longitude:.3f}{tag}{via}"
+    via = f" (matched “{bidi_isolate(matched_via)}”)" if matched_via else ""
+    # The resolved name may be right-to-left ("تنگه هرمز"); isolate it or the
+    # bidi algorithm transposes the lat/lon that follow, so the line renders as
+    # a different set of coordinates than the ones actually used.
+    note = (
+        f"{bidi_isolate(best.short_name)} → "
+        f"{best.latitude:.3f}, {best.longitude:.3f}{tag}{via}"
+    )
     return Region.from_point(best.short_name, best.latitude, best.longitude), "search", note
 
 

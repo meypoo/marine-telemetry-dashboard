@@ -59,6 +59,40 @@ def test_text_elements_have_overflow_handling() -> None:
         )
 
 
+def test_footnote_prose_wraps_instead_of_truncating() -> None:
+    """Regression: the Data Lab footer reused the metric-tile class, so it was
+    clipped mid-sentence — hiding the "parsed locally, not transmitted"
+    statement entirely. Prose must wrap; only the narrow tiles ellipsize."""
+    body = _rule(".mx-footnote")
+    assert "white-space: normal" in body, ".mx-footnote must wrap"
+    assert "text-overflow: ellipsis" not in body, (
+        "a privacy statement must never be truncated"
+    )
+    # And the tile subtitle keeps its ellipsis, which is correct there.
+    assert "text-overflow: ellipsis" in _rule(".mx-sub")
+
+
+def test_long_kv_key_cannot_touch_its_value() -> None:
+    """A key wider than the column ("temperature ~ dissolved_oxygen") ran
+    straight into its value with no separating space."""
+    body = _rule(".mx-kv .k")
+    assert "padding-right" in body, (
+        "the key needs padding so an overlong key still separates from its value"
+    )
+    assert "box-sizing: border-box" in body, (
+        "border-box keeps short keys aligned once padding is added"
+    )
+
+
+def test_nav_link_has_no_light_background_or_radius() -> None:
+    """Streamlit's active-page nav link carries a light, rounded background by
+    default, which renders as a white box on INK and breaks the sharp-corner
+    rule."""
+    body = _rule('a[data-testid="stPageLink-NavLink"]')
+    assert "background: transparent" in body, "nav link background not overridden"
+    assert "border-radius: 0" in body, "nav link must not be rounded"
+
+
 def test_panel_head_shrinks_so_the_chip_can_ellipsize() -> None:
     """An ellipsis only takes effect if the flex item is allowed to shrink."""
     assert "min-width: 0" in _rule(".tm-panelhead > div:first-child"), (
@@ -158,6 +192,9 @@ def test_no_hard_coded_hex_outside_the_token_table() -> None:
 
 ALL = [
     test_text_elements_have_overflow_handling,
+    test_footnote_prose_wraps_instead_of_truncating,
+    test_long_kv_key_cannot_touch_its_value,
+    test_nav_link_has_no_light_background_or_radius,
     test_panel_head_shrinks_so_the_chip_can_ellipsize,
     test_title_truncates_instead_of_bleeding_into_the_search_box,
     test_axis_labels_do_not_wrap,

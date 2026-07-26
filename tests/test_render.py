@@ -317,6 +317,46 @@ def test_gloss_is_html_escaped() -> None:
         ui.GLOSSARY.update(original)
 
 
+def test_rtl_names_cannot_transpose_adjacent_numbers() -> None:
+    """Regression: a right-to-left place name ("تنگه هرمز") reorders the neutral
+    text around it, so a "name → lat, lon" line rendered with the coordinates
+    visually swapped — reading as an entirely different location. The name must
+    be wrapped in Unicode bidi isolates, which survive HTML escaping."""
+    from ui import bidi_isolate, esc
+
+    FSI, PDI = "⁨", "⁩"
+    rtl = "تنگه هرمز"
+    isolated = bidi_isolate(rtl)
+    assert isolated.startswith(FSI) and isolated.endswith(PDI)
+    assert rtl in isolated
+
+    # Must survive escaping — these are the contexts it is used in.
+    escaped = esc(f"{isolated} → 26.449, 56.203")
+    assert FSI in escaped and PDI in escaped, "isolation lost through esc()"
+    # The isolate must close *before* the coordinates, or they are still inside
+    # the RTL run and can still be reordered.
+    assert escaped.index(PDI) < escaped.index("26.449")
+
+    assert bidi_isolate("") == "", "empty input must not gain stray controls"
+
+
+def test_location_subtitle_isolates_the_region_name() -> None:
+    from api_clients import Region
+    from terminal_render import location_subtitle
+
+    subtitle = location_subtitle(Region.from_point("تنگه هرمز", 26.4, 56.2),
+                                 "model_only")
+    assert "⁨" in subtitle and "⁩" in subtitle, (
+        "a searched RTL name must be isolated in the subtitle"
+    )
+    assert "model-only SST" in subtitle
+
+
+def test_comparison_isolates_region_names() -> None:
+    html = render_comparison(_assessment(80.0, "تنگه هرمز"), _assessment(30.0))
+    assert "⁨" in html, "comparison should isolate region names"
+
+
 def test_new_panels_hardcode_no_hex_outside_the_token_table() -> None:
     """Every colour in the new markup must come from ui's tokens."""
     tokens = {
@@ -356,6 +396,9 @@ ALL = [
     test_previous_score_accounts_for_rate_limited_history,
     test_jargon_terms_carry_a_hover_gloss,
     test_gloss_is_html_escaped,
+    test_rtl_names_cannot_transpose_adjacent_numbers,
+    test_location_subtitle_isolates_the_region_name,
+    test_comparison_isolates_region_names,
     test_new_panels_hardcode_no_hex_outside_the_token_table,
 ]
 

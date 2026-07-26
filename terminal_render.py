@@ -21,7 +21,8 @@ from analyzer import StressAssessment
 from api_clients import BuoySnapshot, Region, RegionSnapshot
 from ui import (
     BORDER_STRONG, CANOPY, INK, LINE, MIST, PAPER, PAPER_DIM, SIGNAL,
-    SOURCE_COLOURS, TerminalConfig, esc, fmt, gloss_attr, stress_accent,
+    SOURCE_COLOURS, TerminalConfig, bidi_isolate, esc, fmt, gloss_attr,
+    stress_accent,
 )
 
 __all__ = [
@@ -74,6 +75,23 @@ def _section(label: str, rows: Iterable[str], *, first: bool = False) -> str:
     return (
         f'<div class="{divider.strip() or ""}">'
         f'<div class="tm-seclabel">{esc(label)}</div>{"".join(rows)}</div>'
+    )
+
+
+def _legend_swatch(colour: str, dash: str = "") -> str:
+    """A short inline-SVG line for a chart legend.
+
+    Drawn rather than typed: the box-drawing glyphs (``━`` vs ``╌``) fall back to
+    visually identical short dashes in Space Mono, so a typed legend cannot say
+    which series is solid and which is dashed. An SVG swatch reproduces the
+    exact stroke the chart uses.
+    """
+    attr = f' stroke-dasharray="{dash}"' if dash else ""
+    return (
+        '<svg width="20" height="8" viewBox="0 0 20 8" '
+        'style="vertical-align:middle;margin-right:4px">'
+        f'<line x1="0" y1="4" x2="20" y2="4" stroke="{colour}" '
+        f'stroke-width="2"{attr}/></svg>'
     )
 
 
@@ -196,10 +214,13 @@ def _line_chart(
         # MIST, not BORDER_STRONG: this line is the interpretive anchor of the
         # chart and BORDER_STRONG sits at 1.9:1 on INK, below the 3:1 minimum
         # for meaningful non-text marks — it was effectively invisible.
+        # Dotted (2,3), distinct from the model series' dash (6,4) — two dashed
+        # MIST lines on one chart are otherwise hard to tell apart. The legend
+        # swatches mirror these patterns exactly.
         parts.append(
             f'<line x1="0" y1="{y_of(baseline):.1f}" x2="{width}" '
             f'y2="{y_of(baseline):.1f}" stroke="{MIST}" stroke-width="1" '
-            f'stroke-dasharray="5,5"/>'
+            f'stroke-dasharray="2,3"/>'
         )
     for index, (_, colour, values) in enumerate(series):
         xs = None
@@ -313,7 +334,11 @@ def location_subtitle(region: Region, coverage: str) -> str:
         "none": " · no marine data here",
         "model_only": " · model-only SST",
     }.get(coverage, "")
-    return f"Live environmental risk telemetry · {region.name}{tail}"
+    # Isolated: a searched RTL name would otherwise drag the separators and the
+    # coverage tail around it into the wrong visual order.
+    return (
+        f"Live environmental risk telemetry · {bidi_isolate(region.name)}{tail}"
+    )
 
 
 def render_footer() -> str:
@@ -638,10 +663,12 @@ def _sst_panel(snapshot: RegionSnapshot, assessment: StressAssessment,
         in_situ_span = f" · {covered:.0f}h window"
     legend = (
         '<div class="tm-legend">'
-        f'<span style="color:{CANOPY}">━ NDBC {esc(station)} in-situ'
-        f"{esc(in_situ_span)}</span>"
-        f'<span style="color:{MIST}">╌ Open-Meteo model</span>'
-        f'<span style="color:{MIST}">╌ 10y baseline</span>'
+        f'<span style="color:{CANOPY}">{_legend_swatch(CANOPY)}'
+        f"NDBC {esc(station)} in-situ{esc(in_situ_span)}</span>"
+        f'<span style="color:{MIST}">{_legend_swatch(MIST, "6,4")}'
+        "Open-Meteo model</span>"
+        f'<span style="color:{MIST}">{_legend_swatch(MIST, "2,3")}'
+        "10y baseline</span>"
         "</div>"
     )
     body = (
@@ -682,7 +709,8 @@ def _sst_panel(snapshot: RegionSnapshot, assessment: StressAssessment,
     return (
         "<section>"
         f'<div class="tm-panelhead">'
-        f'{_chip(f"SEA SURFACE TEMPERATURE — {region.name.upper()}")}{legend}</div>'
+        f'{_chip(f"SEA SURFACE TEMPERATURE — {bidi_isolate(region.name.upper())}")}'
+        f"{legend}</div>"
         f"{body}{drawer}</section>"
     )
 
@@ -738,11 +766,27 @@ def _baseline_panel(snapshot: RegionSnapshot, assessment: StressAssessment) -> s
     ]
     drawer = _drawer("PER-YEAR BASELINE & STATISTICS", per_year + _detail_rows(base_pairs))
 
+    # The amber rule across the bars is the present-day SST. It had no label
+    # anywhere, leaving an unexplained line over ten green bars; name it, and
+    # give its value, the same way the SST panel labels its series.
+    current = assessment.current_sst_c
+    legend = (
+        '<div class="tm-legend">'
+        + f'<span style="color:{CANOPY}">{_legend_swatch(CANOPY)}'
+        + "annual window mean</span>"
+        + (
+            f'<span style="color:{SIGNAL}">{_legend_swatch(SIGNAL)}'
+            f"current SST {current:.2f} °C</span>"
+            if current is not None
+            else ""
+        )
+        + "</div>"
+    )
     return (
         "<section>"
-        + _chip(label, block=True)
+        + f'<div class="tm-panelhead"><div>{_chip(label)}</div>{legend}</div>'
         + '<div style="margin-top:10px">'
-        + _bar_chart(years, values, assessment.current_sst_c)
+        + _bar_chart(years, values, current)
         + "</div>"
         + drawer
         + "</section>"
@@ -835,6 +879,17 @@ def _composition_panels(snapshot: RegionSnapshot) -> str:
     )
 
 
+def _traffic_summary(infra) -> str:
+    """Routing/berthing share, distinguishing 'none here' from 'not sampled'."""
+    if infra is None:
+        return "--"
+    if infra.sampled_elements:
+        return f"{infra.traffic_features:,} of {infra.sampled_elements:,}"
+    if infra.total_count:
+        return "tag sample unavailable"
+    return "none charted here"
+
+
 def _stats_strip(snapshot: RegionSnapshot, assessment: StressAssessment,
                  region: Region) -> str:
     obis = snapshot.obis
@@ -871,12 +926,10 @@ def _stats_strip(snapshot: RegionSnapshot, assessment: StressAssessment,
         stat("Bounding-box area", f"{region.area_km2:,.0f} km²"),
         stat("Seamark density",
              f"{infra.density_per_1000km2:.2f} / 1000 km²" if infra else "--"),
-        # "0 of 0" would read as "no routing features" when in fact the tag
-        # query failed and composition is simply unknown.
-        stat("Routing / berthing",
-             (f"{infra.traffic_features:,} of {infra.sampled_elements:,}"
-              if infra.sampled_elements else "tag sample unavailable")
-             if infra else "--"),
+        # Three distinct states, and they must not be conflated: a real count,
+        # a genuinely empty box (measured, zero features), and features that
+        # exist but whose tags could not be sampled (composition unknown).
+        stat("Routing / berthing", _traffic_summary(infra)),
         stat("Baseline years", str(climatology.years_covered) if climatology else "--"),
         stat("Baseline observations",
              f"{climatology.observations:,}" if climatology else "--"),
@@ -1116,7 +1169,8 @@ def render_comparison(
             f'<div style="font-size:26px;font-weight:700;color:{colour};'
             f'line-height:1.2">{esc(value)}</div>'
             f'<div class="tm-mist" style="font-size:11.5px">'
-            f"{esc(assessment.region_name)} · {esc(assessment.band)} · "
+            f"{esc(bidi_isolate(assessment.region_name))} · "
+            f"{esc(assessment.band)} · "
             f"confidence {assessment.confidence:.0%}</div>"
             "</div>"
         )
@@ -1124,7 +1178,7 @@ def render_comparison(
     if primary.score is not None and other.score is not None:
         delta = primary.score - other.score
         verdict = (
-            f"{esc(primary.region_name)} is {abs(delta):.1f} points "
+            f"{esc(bidi_isolate(primary.region_name))} is {abs(delta):.1f} points "
             f"{'more' if delta > 0 else 'less'} stressed"
             if abs(delta) >= 0.05
             else "both regions score the same"

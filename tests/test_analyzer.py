@@ -231,6 +231,44 @@ def test_only_lower_bound_of_trend_is_scored() -> None:
     )
 
 
+def test_empty_bounding_box_is_a_reading_not_missing_data() -> None:
+    """Regression: with the single-query Overpass fetch, a region that genuinely
+    has no charted seamarks returns total=0 AND sampled=0 — the same shape that
+    used to mean "the tag query failed". Reporting it as unavailable data (and
+    docking quality for it) was false on both counts."""
+    empty = InfrastructureSnapshot(total_count=0, sampled_elements=0,
+                                   area_km2=5_000.0)
+    component = analyzer._score_pressure(empty)
+
+    assert component.available
+    assert component.quality == 1.0, (
+        f"a successfully measured empty box scored quality {component.quality}; "
+        "nothing was missing, so confidence should not be reduced"
+    )
+    joined = " ".join(component.notes)
+    assert "tag sample unavailable" not in joined, (
+        f"claimed the sample was unavailable when it was not: {component.notes}"
+    )
+    assert "no charted seamarks" in joined, (
+        "the empty result should still be explained"
+    )
+
+
+def test_untagged_features_still_report_the_sample_as_unavailable() -> None:
+    """The other side of the same branch: features exist but their tags could
+    not be fetched, so composition really is unknown and quality really drops."""
+    untagged = InfrastructureSnapshot(total_count=227, node_count=200,
+                                      way_count=27, sampled_elements=0,
+                                      area_km2=3_000.0)
+    component = analyzer._score_pressure(untagged)
+
+    assert component.available
+    assert component.quality < 1.0, "a missing composition term must cost quality"
+    assert any("tag sample unavailable" in n for n in component.notes), (
+        f"expected the density-only note, got {component.notes}"
+    )
+
+
 def test_component_failure_is_isolated_not_fatal() -> None:
     """Each component guards its own computation, so bad feed data degrades that
     axis instead of aborting the index. (The guard lives inside each _score_*
@@ -262,6 +300,8 @@ ALL = [
     test_thermal_quality_tracks_years_requested_not_a_hardcoded_decade,
     test_partial_baseline_coverage_reduces_quality,
     test_only_lower_bound_of_trend_is_scored,
+    test_empty_bounding_box_is_a_reading_not_missing_data,
+    test_untagged_features_still_report_the_sample_as_unavailable,
     test_component_failure_is_isolated_not_fatal,
 ]
 

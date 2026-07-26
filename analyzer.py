@@ -430,13 +430,23 @@ def _score_pressure(infra: InfrastructureSnapshot | None) -> ComponentScore:
             traffic_score = _clamp(traffic_share / TRAFFIC_SHARE_SATURATION * 100.0)
             score = 0.65 * density_score + 0.35 * traffic_score
             quality = 1.0
-        else:
-            # Count query succeeded but the tag sample did not: density only.
+        elif infra.total_count > 0:
+            # Features exist but their tags could not be sampled: density only,
+            # at reduced quality because the composition term is missing.
             traffic_share = 0.0
             traffic_score = 0.0
             score = density_score
             quality = 0.6
             component.notes.append("tag sample unavailable; density-only scoring")
+        else:
+            # Nothing charted here, measured successfully. A genuinely empty
+            # bounding box is a real reading (zero pressure), not missing data:
+            # claiming "tag sample unavailable" would be false, and docking
+            # quality would understate a result we are fully confident in.
+            traffic_share = 0.0
+            traffic_score = 0.0
+            score = density_score
+            quality = 1.0
 
         component.score = _clamp(score)
         component.available = True
