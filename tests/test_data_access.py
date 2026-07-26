@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -324,6 +326,90 @@ def test_history_ignores_scoreless_and_torn_lines() -> None:
     _with_temp_cache(body)
 
 
+def _instrument_fetch(monkey_delay: float = 0.25):
+    """Replace data_access.fetch_feeds with a counter that records how many
+    fan-outs run and the peak concurrency. Returns (stats, restore)."""
+    stats = {"calls": 0, "concurrent": 0, "max": 0}
+    lock = threading.Lock()
+    saved = data_access.fetch_feeds
+
+    async def fake(region, feeds, **kw):
+        with lock:
+            stats["calls"] += 1
+            stats["concurrent"] += 1
+            stats["max"] = max(stats["max"], stats["concurrent"])
+        time.sleep(monkey_delay)
+        with lock:
+            stats["concurrent"] -= 1
+        return FeedBundle(
+            feeds_requested=list(feeds),
+            fetched_at=datetime.now(timezone.utc),
+        )
+
+    data_access.fetch_feeds = fake
+    return stats, (lambda: setattr(data_access, "fetch_feeds", saved))
+
+
+def test_single_flight_collapses_same_key_stampede() -> None:
+    """N concurrent cold loads of the SAME region must fan out once (per tier),
+    not N times — the shared-cache thundering-herd guard."""
+    stats, restore = _instrument_fetch()
+    region = Region.from_point("Stampede", 12.0, 34.0)
+    # Fresh caches so this is a genuine cold miss.
+    data_access._fetch_dynamic.clear()
+    data_access._fetch_context.clear()
+    try:
+        threads = [
+            threading.Thread(target=lambda: data_access.load_region(region))
+            for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # Two tiers (dynamic + context), one fan-out each.
+        assert stats["calls"] == 2, (
+            f"8 concurrent same-region loads triggered {stats['calls']} fetches; "
+            "single-flight should collapse them to 2 (dynamic + context)"
+        )
+    finally:
+        restore()
+
+
+def test_global_cap_bounds_distinct_key_concurrency() -> None:
+    """A burst of DISTINCT cold searches must not open more than the configured
+    number of concurrent upstream fan-outs."""
+    stats, restore = _instrument_fetch()
+    saved_gate = data_access._FETCH_GATE
+    data_access._FETCH_GATE = threading.BoundedSemaphore(3)
+    data_access._fetch_dynamic.clear()
+    data_access._fetch_context.clear()
+    try:
+        regions = [Region.from_point(f"D{i}", 10.0 + i, 20.0) for i in range(12)]
+        threads = [
+            threading.Thread(target=lambda rr=rr: data_access.load_region(rr))
+            for rr in regions
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert stats["max"] <= 3, (
+            f"peak concurrent fan-outs was {stats['max']}, exceeding the cap of 3"
+        )
+        assert stats["max"] >= 2, "the cap should still allow real concurrency"
+    finally:
+        data_access._FETCH_GATE = saved_gate
+        restore()
+
+
+def test_bump_refresh_advances_the_global_generation() -> None:
+    before = data_access.refresh_generation()
+    after = data_access.bump_refresh()
+    assert after == before + 1
+    assert data_access.refresh_generation() == after
+
+
 ALL = [
     test_persist_restore_roundtrip,
     test_atomic_write_leaves_no_temp_files,
@@ -336,6 +422,9 @@ ALL = [
     test_context_tier_retries_after_a_failed_feed,
     test_history_appends_rate_limits_and_prunes,
     test_history_ignores_scoreless_and_torn_lines,
+    test_single_flight_collapses_same_key_stampede,
+    test_global_cap_bounds_distinct_key_concurrency,
+    test_bump_refresh_advances_the_global_generation,
 ]
 
 

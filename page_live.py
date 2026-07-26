@@ -22,7 +22,9 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from api_clients import REGIONS, Region
-from data_access import CACHE_TTL_SECONDS, load_history, load_region
+from data_access import (
+    CACHE_TTL_SECONDS, bump_refresh, load_history, load_region,
+)
 from geocoding import (
     GeocodeResult, GeocodingError, geocode, marine_query_variants, parse_latlon,
 )
@@ -62,9 +64,6 @@ def _alert_threshold() -> float:
 #: data rather than re-rendering the same cached snapshot. Overridable with
 #: ``?refresh=<seconds>``.
 AUTO_REFRESH_SECONDS = max(config.refresh_seconds, CACHE_TTL_SECONDS + 120)
-
-if "nonce" not in st.session_state:
-    st.session_state.nonce = 0
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=128)
@@ -242,7 +241,9 @@ def _render() -> None:
         )
     with refresh_col:
         if st.button("REFRESH", use_container_width=True):
-            st.session_state.nonce += 1
+            # Global, not per-session: one viewer's refresh re-pulls the fast
+            # feeds once and every viewer sees the fresh data (shared cache).
+            bump_refresh()
     with nav_col:
         safe_page_link("page_live.py", "LIVE INDEX")
         safe_page_link("page_lab.py", "DATA LAB")
@@ -256,7 +257,7 @@ def _render() -> None:
         "location takes a few moments; cached locations are instant."
     ):
         region, source, note = _resolve_location(search_text, curated)
-        result = load_region(region, st.session_state.nonce)
+        result = load_region(region)
     coverage = result.snapshot.marine_coverage if result.ok else "unknown"
 
     with title_col:
@@ -346,7 +347,7 @@ def _render() -> None:
     comparison = ""
     if compare_name != "COMPARE: OFF" and compare_name != region.name:
         compare_region = next(r for r in REGIONS if r.name == compare_name)
-        compare_result = load_region(compare_region, st.session_state.nonce)
+        compare_result = load_region(compare_region)
         if compare_result.ok:
             comparison = render_comparison(
                 result.assessment, compare_result.assessment,

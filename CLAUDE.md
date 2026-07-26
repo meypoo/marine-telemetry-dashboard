@@ -33,7 +33,9 @@ Query-parameter dev flags (from the design handoff): `?density=compact` tightens
 
 Environment overrides, all optional and defaulted to the current values: `MEHI_CONTACT` (the User-Agent
 contact sent to Nominatim/Overpass — set a real one when deploying under a different operator),
-`MEHI_HTTP_TIMEOUT`, `MEHI_DYNAMIC_TTL`, `MEHI_CONTEXT_TTL`, `MEHI_HISTORY_DAYS`.
+`MEHI_HTTP_TIMEOUT`, `MEHI_DYNAMIC_TTL`, `MEHI_CONTEXT_TTL`, `MEHI_HISTORY_DAYS`, `MEHI_OVERPASS_BUDGET`,
+`MEHI_MAX_CONCURRENT_FETCHES` (aggregate cap on concurrent upstream fetches across all sessions, default 4),
+and `DATABASE_URL` / `MEHI_HISTORY_DB` (Postgres URL for durable score history; unset → local JSONL).
 
 The suite above does not exercise the rendered UI, so verify UI changes with Streamlit's own harness — note
 that `AppTest` does *not* put the app directory on `sys.path` the way `streamlit run` does:
@@ -173,8 +175,8 @@ The dashboard is expected to run overnight with nobody watching, so failures deg
   margin so each timed rerun pulls genuinely fresh data instead of re-rendering the same cached snapshot.
 - **Volatility-tiered caching.** The five feeds age at very different rates, so `data_access` caches them in
   two tiers and composes the `RegionSnapshot`: a *dynamic* tier (buoy + model SST) cached ~10 min and keyed by
-  `(code, nonce)` so REFRESH re-pulls it, and a *context* tier (OISST baseline + OBIS + Overpass) keyed by
-  `(code, UTC-date)` and cached a day, since it is stable within a day. A timed refresh then re-fetches only
+  `(code, refresh-generation)` so REFRESH re-pulls it, and a *context* tier (OISST baseline + OBIS + Overpass)
+  keyed by `(code, UTC-date)` and cached a day, since it is stable within a day. A timed refresh then re-fetches only
   the fast feeds — measured **25 s cold to 1.5 s refresh (~94% less)** — instead of re-pulling the ~70 s
   baseline every cycle. `_compose` sets `fetched_at`/wall-clock from the live tier and merges both tiers'
   telemetry, so the console honestly shows each feed's last request time. New feeds go in the tier matching
@@ -188,6 +190,23 @@ The dashboard is expected to run overnight with nobody watching, so failures deg
   otherwise sit in the cache until the UTC date rolled over. `_schedule_context_retry` therefore folds a retry
   generation into the context cache key whenever the bundle carries feed errors, spaced at least `DYNAMIC_TTL`
   apart so a persistent outage is retried once per refresh cycle rather than on every page load.
+- **Multi-user on one instance.** The two `st.cache_data` tiers are process-global and shared by *every*
+  browser session, so once one visitor warms a region/day the rest hit cache and issue zero upstream calls —
+  which is why a single instance serves dozens of viewers and why you must run *one* instance, not replicas
+  (replicas would not share the cache). Two in-process guards handle concurrent *cold* misses, both in
+  `data_access`: `_single_flight` (a per-key lock registry with a waiter refcount) collapses a same-region
+  stampede to one fetch, and `_FETCH_GATE` (a `threading.BoundedSemaphore`, `MEHI_MAX_CONCURRENT_FETCHES`)
+  bounds the aggregate concurrent fan-out so a burst of distinct searches cannot trip the shared-IP rate
+  limits. REFRESH bumps a **process-global** generation (`bump_refresh`), so one viewer's refresh re-warms the
+  dynamic tier once for everyone rather than forking a private cache entry per session. The Nominatim throttle
+  (`geocoding._throttle`) stays a global 1 req/1.1 s by policy; its 1-hour result cache absorbs popular
+  searches.
+- **Durable score history.** History is the one piece of state that must survive a redeploy on an ephemeral
+  host, so `load_history`/`_append_history` are a seam: with `DATABASE_URL` (or `MEHI_HISTORY_DB`) set they go
+  to Postgres (`psycopg`, one lock-guarded connection, reconnect-on-drop for a serverless DB resuming from
+  suspend); unset, they use the local `.jsonl` mirror unchanged. History I/O is best-effort — a DB failure
+  degrades to `[]`/silent, and a *missing* `psycopg` disables the DB path once and falls back to local. The
+  same ≤1/30-min rate limit and `HISTORY_RETENTION_DAYS` prune apply on both backends.
 - `data_access.load_region()` never raises. On a failed fetch it returns the last good result for that region —
   from process memory, or from the `.cache/` JSON mirror if the server has restarted — flagged `stale`, with
   the failure reason attached. The page then shows a `SHOWING LAST GOOD DATA` banner over a populated

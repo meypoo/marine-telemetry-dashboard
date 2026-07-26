@@ -75,7 +75,17 @@ fit misreads as −0.72) and runs in CI.
 - **Environment overrides:** `MEHI_CONTACT` (User-Agent contact for
   Nominatim/Overpass — set a real one when deploying), `MEHI_HTTP_TIMEOUT`,
   `MEHI_DYNAMIC_TTL`, `MEHI_CONTEXT_TTL`, `MEHI_HISTORY_DAYS`,
-  `MEHI_OVERPASS_BUDGET`.
+  `MEHI_OVERPASS_BUDGET`, `MEHI_MAX_CONCURRENT_FETCHES` (aggregate cap on
+  concurrent upstream fetches across all sessions, default 4), and
+  `DATABASE_URL` / `MEHI_HISTORY_DB` (Postgres URL for durable score history;
+  unset falls back to local JSONL — see Hosting below).
+- **Concurrency.** The feed caches are process-global and **shared across every
+  browser session**, so once one visitor warms a region/day the rest hit cache
+  and issue zero upstream calls. Concurrent *cold* misses for the same region are
+  coalesced into one fetch (single-flight), and the aggregate is bounded by
+  `MEHI_MAX_CONCURRENT_FETCHES`. This is why a single instance comfortably serves
+  dozens of viewers; it is also why you should run **one** instance, not replicas
+  (replicas would not share the cache).
 - **Speed.** A warm rerun is ~12 ms and REFRESH ~1.4 s; a *cold* load for a
   location never seen before is 8-20 s, dominated by Overpass. Searching a new
   place is slower than picking a curated region because it misses both cache
@@ -88,6 +98,21 @@ fit misreads as −0.72) and runs in CI.
 Full instructions, an nginx reverse-proxy config, and a docker-compose file are
 in [`deploy/`](deploy/README.md). In short:
 
+- **Free, always-on hosting (recommended for a public/portfolio site):**
+  [Streamlit Community Cloud](https://streamlit.io/cloud). Push this repo to
+  GitHub, point Community Cloud at it, and set secrets in its UI — `MEHI_CONTACT`
+  (a real address) and, for durable score history, `DATABASE_URL` (a free
+  [Neon](https://neon.tech) serverless Postgres URL). One always-on instance is
+  exactly right here: the shared in-process cache does the heavy lifting, so no
+  Redis or replicas are needed. Two caveats to know going in: the filesystem is
+  **ephemeral** (only *history* needs to survive a redeploy, which is why it goes
+  to Postgres — everything else self-heals from cache), and the outbound IP is
+  **shared with other apps**, so the Nominatim/Overpass per-IP limits are shared
+  — the shared cache, a real `MEHI_CONTACT`, and `MEHI_MAX_CONCURRENT_FETCHES`
+  mitigate this. A portfolio app is public; Community Cloud offers a free viewer
+  allowlist if you want it restricted (no code). The nginx + Basic-auth path
+  below is only for **self-hosting**. See [`deploy/README.md`](deploy/README.md)
+  for the step-by-step.
 - **Windows:** `run_overnight.ps1` (supervised, self-restarting).
 - **Linux/container:** a hardened [`Dockerfile`](Dockerfile) (non-root user) is
   provided; the container runtime's restart policy replaces the supervisor.
@@ -100,18 +125,24 @@ in [`deploy/`](deploy/README.md). In short:
   terminates TLS, adds HTTP Basic auth, and carries the WebSocket-upgrade block
   Streamlit needs. Run the app bound to `127.0.0.1` (or on an internal Docker
   network) so it is unreachable except through the proxy.
-- **Single instance.** Caches are in-process plus a disk mirror; do not run
-  multiple replicas expecting shared state. Public-API rate limits are per
-  source IP — fine for a few viewers, not for dozens searching concurrently.
+- **Single instance, on purpose.** Caches are in-process (shared across all
+  sessions) plus a disk mirror; do not run multiple replicas — they would not
+  share the cache and would multiply upstream load. One instance with the
+  shared cache, single-flight coalescing, and the concurrency cap handles dozens
+  of concurrent viewers. Public-API rate limits are per source IP; a burst of
+  *distinct* new searches from one IP is the residual limit (mitigated, not
+  removed).
 
 ### Known limitations (by design or scope)
 
 - Auto-refresh only ticks while a browser tab is open (inherent to Streamlit
   fragments); the process stays healthy regardless.
-- Single-node. In-process caches and the Nominatim rate-limit are per-worker, so
-  this is not built for horizontal scaling. Heavy geocoding traffic should move
-  to a self-hosted or commercial geocoder (Nominatim's public service is
-  rate-limited and best-effort).
+- Single-node by design. In-process caches are shared across sessions but not
+  across processes, so this scales *up* (one bigger instance, dozens of viewers)
+  rather than *out* (replicas). Score history is the one piece of durable state;
+  it goes to Postgres when `DATABASE_URL` is set (else local JSONL). Sustained
+  heavy geocoding beyond "dozens" would want a self-hosted or commercial geocoder
+  — Nominatim's public service is rate-limited and best-effort.
 - No metrics/alerting beyond process supervision and the `logs/` trail.
 
 ## Architecture

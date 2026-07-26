@@ -39,11 +39,12 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Hashable, TypeVar
 
 import streamlit as st
 
@@ -55,10 +56,12 @@ from api_clients import (
 
 __all__ = [
     "LoadResult", "load_region", "load_history", "CACHE_TTL_SECONDS",
-    "HISTORY_RETENTION_DAYS",
+    "HISTORY_RETENTION_DAYS", "bump_refresh", "refresh_generation",
 ]
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 #: Feeds that change fast (minutes-hours): re-fetched on every timed refresh.
 DYNAMIC_FEEDS = ("buoy", "sea_state")
@@ -78,6 +81,14 @@ CACHE_TTL_SECONDS = DYNAMIC_TTL
 #: data, so an all-empty outage result never overwrites a good one on disk.
 _MIN_SOURCES_TO_PERSIST = 2
 
+#: Cap on the number of concurrent upstream fan-outs across ALL sessions. On a
+#: single always-on instance with a shared egress IP, an unbounded burst of
+#: distinct cold searches would trip Overpass/Nominatim per-IP limits; this
+#: bounds the aggregate. Held only during a genuine cache miss (see the fetch
+#: functions), so cache hits never queue behind it.
+MAX_CONCURRENT_FETCHES = max(1, int(os.getenv("MEHI_MAX_CONCURRENT_FETCHES", "4")))
+_FETCH_GATE = threading.BoundedSemaphore(MAX_CONCURRENT_FETCHES)
+
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 
 #: In-process last-known-good, keyed by region code. Survives reruns and
@@ -96,6 +107,63 @@ _CONTEXT_RETRY: dict[str, tuple[int, float]] = {}
 
 def _context_generation(code: str) -> int:
     return _CONTEXT_RETRY.get(code, (0, 0.0))[0]
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency: single-flight + global refresh generation
+# --------------------------------------------------------------------------- #
+# Streamlit runs each browser session's script on its own thread but shares this
+# module's state, so many sessions can miss the same cache key at once. Without
+# coordination, N cold sessions = N full upstream fan-outs.
+
+#: Per-key locks with an active-waiter refcount, so the registry only holds
+#: locks currently in use (bounded by concurrency, not by total keys seen).
+_FLIGHT_LOCKS: dict[Hashable, list] = {}   # key -> [threading.Lock, waiters]
+_FLIGHT_META = threading.Lock()
+
+#: Process-global refresh generation. It keys the dynamic tier, so bumping it
+#: (the REFRESH button) re-warms live conditions once for *every* viewer instead
+#: of forking a private cache entry per session.
+_REFRESH_GEN = 0
+_REFRESH_LOCK = threading.Lock()
+
+
+def refresh_generation() -> int:
+    """Current global refresh generation (keys the dynamic cache tier)."""
+    with _REFRESH_LOCK:
+        return _REFRESH_GEN
+
+
+def bump_refresh() -> int:
+    """Advance the global refresh generation; returns the new value. The manual
+    REFRESH control calls this so all sessions re-pull the fast feeds together."""
+    global _REFRESH_GEN
+    with _REFRESH_LOCK:
+        _REFRESH_GEN += 1
+        return _REFRESH_GEN
+
+
+def _single_flight(key: Hashable, fn: Callable[[], _T]) -> _T:
+    """Run ``fn`` under a per-key lock so concurrent callers for the same key do
+    not all execute it. The first caller computes and fills the shared
+    ``st.cache_data`` store; the rest wait, then their own call hits the warm
+    cache. Exceptions are not cached, so a failed fetch is simply retried by the
+    next waiter rather than stampeding."""
+    with _FLIGHT_META:
+        entry = _FLIGHT_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _FLIGHT_LOCKS[key] = entry
+        entry[1] += 1
+    lock: threading.Lock = entry[0]
+    with lock:
+        try:
+            return fn()
+        finally:
+            with _FLIGHT_META:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    _FLIGHT_LOCKS.pop(key, None)
 
 
 def _schedule_context_retry(code: str, context: FeedBundle) -> None:
@@ -168,6 +236,128 @@ HISTORY_RETENTION_DAYS = int(os.getenv("MEHI_HISTORY_DAYS", "90"))
 #: near-identical rows.
 HISTORY_MIN_INTERVAL_SECONDS = 1800.0
 
+#: Score history is the one piece of state that must survive a redeploy on an
+#: ephemeral-filesystem host. When a Postgres URL is configured it is stored
+#: there; otherwise it falls back to the local JSONL mirror (local dev, or a
+#: host with persistent disk). Everything else stays in-process / on local disk.
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("MEHI_HISTORY_DB")
+
+#: One shared connection guarded by a lock — history I/O is low-frequency, so a
+#: pool is unnecessary; the lock keeps psycopg's non-thread-safe connection
+#: safe across session threads. Reconnected on failure (handles a serverless DB
+#: resuming from suspend).
+_pg_conn = None
+_pg_lock = threading.Lock()
+
+
+#: Set true if the DB path is configured but unusable for a *permanent* reason
+#: (psycopg not installed). Disables the DB path for the process so the fallback
+#: to local history is clean instead of logging a traceback on every render.
+_pg_disabled = False
+
+
+def _history_uses_db() -> bool:
+    return bool(DATABASE_URL) and not _pg_disabled
+
+
+def _pg_run(fn: Callable[[Any], _T]) -> _T:
+    """Run ``fn(connection)`` under the lock, reconnecting once on a dropped or
+    suspended connection. Raises on a second failure; callers treat history I/O
+    as best-effort and swallow it."""
+    global _pg_conn, _pg_disabled
+    try:
+        import psycopg  # lazy: only needed when a DB is configured
+    except ImportError as exc:
+        # Permanent config error (DATABASE_URL set but the driver is missing).
+        # Disable the DB path once, loudly, and let callers fall back to local.
+        _pg_disabled = True
+        raise RuntimeError(
+            "DATABASE_URL is set but psycopg is not installed "
+            "(pip install 'psycopg[binary]'); using local history"
+        ) from exc
+
+    with _pg_lock:
+        last: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                if _pg_conn is None or _pg_conn.closed:
+                    _pg_conn = psycopg.connect(
+                        DATABASE_URL, autocommit=True, connect_timeout=10
+                    )
+                    _pg_ensure_schema(_pg_conn)
+                return fn(_pg_conn)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                try:
+                    if _pg_conn is not None:
+                        _pg_conn.close()
+                except Exception:
+                    pass
+                _pg_conn = None
+        raise last  # type: ignore[misc]
+
+
+def _pg_ensure_schema(conn) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS score_history ("
+        " id bigserial PRIMARY KEY,"
+        " code text NOT NULL,"
+        " at timestamptz NOT NULL,"
+        " score double precision,"
+        " band text,"
+        " confidence double precision)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS score_history_code_at"
+        " ON score_history (code, at)"
+    )
+
+
+def _pg_load_history(region_code: str) -> list[dict[str, Any]]:
+    def query(conn) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT at, score, band, confidence FROM score_history"
+            " WHERE code = %s AND score IS NOT NULL ORDER BY at ASC",
+            (region_code,),
+        ).fetchall()
+        return [
+            {
+                "at": at.isoformat(),
+                "score": float(score),
+                "band": band,
+                "confidence": float(confidence) if confidence is not None else None,
+            }
+            for at, score, band, confidence in rows
+        ]
+
+    return _pg_run(query)
+
+
+def _pg_append_history(region_code: str, assessment: StressAssessment) -> None:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=HISTORY_RETENTION_DAYS)
+
+    def write(conn) -> None:
+        # Rate-limit: skip if the last point for this code is too recent.
+        last = conn.execute(
+            "SELECT max(at) FROM score_history WHERE code = %s", (region_code,)
+        ).fetchone()[0]
+        if last is not None and (now - last).total_seconds() < HISTORY_MIN_INTERVAL_SECONDS:
+            return
+        conn.execute(
+            "INSERT INTO score_history (code, at, score, band, confidence)"
+            " VALUES (%s, %s, %s, %s, %s)",
+            (region_code, now, assessment.score, assessment.band,
+             assessment.confidence),
+        )
+        # Prune this code's rows past retention (matches the local backend).
+        conn.execute(
+            "DELETE FROM score_history WHERE code = %s AND at < %s",
+            (region_code, cutoff),
+        )
+
+    _pg_run(write)
+
 
 #: Cap on the number of distinct locations mirrored to disk. Searched locations
 #: are user-driven and otherwise unbounded, so the oldest are evicted once this
@@ -227,9 +417,24 @@ def load_history(region_code: str) -> list[dict[str, Any]]:
     """Score history for a region, oldest first. Never raises.
 
     Entries are ``{"at": iso8601, "score": float, "band": str,
-    "confidence": float}``. Returns an empty list when nothing has been
-    recorded yet (a fresh install, or a region only just searched).
+    "confidence": float}``. Returns an empty list when nothing has been recorded
+    yet. Dispatches to Postgres when a database is configured (so history
+    survives a redeploy on an ephemeral host), else the local JSONL mirror.
     """
+    if _history_uses_db():
+        try:
+            return _pg_load_history(region_code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DB history read failed for %s: %s", region_code, exc)
+            # If the DB was permanently disabled (missing driver), fall back to
+            # local for this call too rather than dropping the panel.
+            if not _history_uses_db():
+                return _load_history_local(region_code)
+            return []
+    return _load_history_local(region_code)
+
+
+def _load_history_local(region_code: str) -> list[dict[str, Any]]:
     path = _history_path(region_code)
     entries: list[dict[str, Any]] = []
     try:
@@ -255,16 +460,29 @@ def _append_history(region_code: str, assessment: StressAssessment) -> None:
     """Append one scored observation, rate-limited and pruned. Best-effort.
 
     Appending (rather than overwriting, as the last-known-good mirror does) is
-    what makes a multi-day stress trend possible at all.
+    what makes a multi-day stress trend possible at all. Dispatches to Postgres
+    when configured, else the local JSONL mirror.
     """
     if assessment.score is None:
         return
+    if _history_uses_db():
+        try:
+            _pg_append_history(region_code, assessment)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DB history append failed for %s: %s", region_code, exc)
+            if not _history_uses_db():  # permanently disabled → use local
+                _append_history_local(region_code, assessment)
+        return
+    _append_history_local(region_code, assessment)
+
+
+def _append_history_local(region_code: str, assessment: StressAssessment) -> None:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         path = _history_path(region_code)
         now = datetime.now(timezone.utc)
 
-        existing = load_history(region_code)
+        existing = _load_history_local(region_code)
         if existing:
             try:
                 last = datetime.fromisoformat(existing[-1]["at"])
@@ -318,10 +536,12 @@ def _restore(region_code: str) -> tuple[RegionSnapshot, StressAssessment] | None
 # --------------------------------------------------------------------------- #
 @st.cache_data(ttl=DYNAMIC_TTL, show_spinner=False, max_entries=64)
 def _fetch_dynamic(_region: Region, cache_key: tuple[str, int]) -> FeedBundle:
-    """Fast-changing feeds (buoy + model SST). ``cache_key`` is ``(code, nonce)``
-    so REFRESH re-pulls them; ``_region`` is excluded from the hash by its
-    leading underscore."""
-    return asyncio.run(fetch_feeds(_region, DYNAMIC_FEEDS))
+    """Fast-changing feeds (buoy + model SST). ``cache_key`` is
+    ``(code, refresh-generation)`` so a global REFRESH re-pulls them for
+    everyone; ``_region`` is excluded from the hash by its leading underscore.
+    The body only runs on a miss, so the concurrency gate bounds real fetches."""
+    with _FETCH_GATE:
+        return asyncio.run(fetch_feeds(_region, DYNAMIC_FEEDS))
 
 
 @st.cache_data(ttl=CONTEXT_TTL, show_spinner=False, max_entries=64, persist="disk")
@@ -340,7 +560,8 @@ def _fetch_context(_region: Region, cache_key: tuple[str, str, int]) -> FeedBund
     pull the next day, and the retry generation still forces one after a failure.
     The dynamic tier is deliberately NOT persisted: it is meant to be fresh.
     """
-    return asyncio.run(fetch_feeds(_region, CONTEXT_FEEDS))
+    with _FETCH_GATE:
+        return asyncio.run(fetch_feeds(_region, CONTEXT_FEEDS))
 
 
 def _compose(
@@ -393,7 +614,7 @@ def _remember(code: str, snapshot: RegionSnapshot, assessment: StressAssessment)
     _append_history(code, assessment)
 
 
-def load_region(region: Region | str, nonce: int = 0) -> LoadResult:
+def load_region(region: Region | str, nonce: int | None = None) -> LoadResult:
     """Load a region, degrading to the last good result instead of raising.
 
     Accepts either a curated region code (looked up in ``REGIONS_BY_CODE``) or a
@@ -401,19 +622,30 @@ def load_region(region: Region | str, nonce: int = 0) -> LoadResult:
     locations flow through the same caching, persistence and fallback path as
     the built-in regions.
 
-    The dynamic and context tiers are fetched (or served from cache) and
-    composed. A partial fetch (some sources down) still counts as success — the
-    analyzer redistributes weights and reports the degradation. Only a total
-    failure to produce a snapshot falls back to cached data.
+    ``nonce`` defaults to the process-global refresh generation, so all sessions
+    share one dynamic-tier cache entry per region; passing an explicit value
+    forces a distinct key (used by tests to bypass the cache). Concurrent cold
+    misses for the same key are coalesced by ``_single_flight`` into one upstream
+    fetch, and the aggregate is bounded by ``_FETCH_GATE``.
+
+    A partial fetch (some sources down) still counts as success — the analyzer
+    redistributes weights and reports the degradation. Only a total failure to
+    produce a snapshot falls back to cached data.
     """
     resolved = REGIONS_BY_CODE[region] if isinstance(region, str) else region
     code = resolved.code
     day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    gen = refresh_generation() if nonce is None else nonce
 
     try:
-        dynamic = _fetch_dynamic(resolved, (code, nonce))
-        context = _fetch_context(
-            resolved, (code, day_key, _context_generation(code))
+        dynamic = _single_flight(
+            ("dyn", code, gen),
+            lambda: _fetch_dynamic(resolved, (code, gen)),
+        )
+        ctx_gen = _context_generation(code)
+        context = _single_flight(
+            ("ctx", code, day_key, ctx_gen),
+            lambda: _fetch_context(resolved, (code, day_key, ctx_gen)),
         )
         _schedule_context_retry(code, context)
         snapshot, assessment = _compose(resolved, dynamic, context)

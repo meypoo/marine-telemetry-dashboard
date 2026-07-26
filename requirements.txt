@@ -9,5 +9,8 @@ scikit-learn==1.9.0     # IsolationForest / PCA / KMeans
 scipy==1.15.2           # Theil-Sen, Kendall tau, autocorrelation peak finding
 numpy==2.2.4            # pulled in by pandas/scipy; pinned for reproducibility
 openpyxl==3.1.5         # Data Lab .xlsx/.xls uploads (the uploader advertises them)
+psycopg[binary]==3.2.6  # durable score history when DATABASE_URL is set (else unused)
 
 # Geocoding (Nominatim) and all HTTP go through httpx above — no extra dependency.
+# psycopg is only imported when DATABASE_URL / MEHI_HISTORY_DB is configured; the
+# app runs without a database (local JSONL history) if it is not installed/set.
