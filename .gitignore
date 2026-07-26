@@ -9,6 +9,14 @@ venv/
 # (Comments must be on their own lines; git has no inline comments.)
 .cache/
 logs/
+# Streamlit's on-disk cache (context tier, persist="disk"); config.toml stays.
+.streamlit/cache/
+
+# Deploy secrets — the *.example templates are committed, these are not.
+deploy/htpasswd
+deploy/certs/
+deploy/nginx.conf
+deploy/docker-compose.yml
 
 # Local Claude Code permission state (machine-specific, not source)
 .claude/settings.local.json

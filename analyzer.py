@@ -2,7 +2,8 @@
 
 The headline number is a **stress** score on 0-100 where *higher means more
 stressed*: 0 is an undisturbed reference state, 100 is severe compound pressure.
-The dashboard colours it accordingly (red above 70, seafoam below 30).
+The dashboard colours it accordingly via ``ui.stress_accent`` (amber at or above
+70, canopy green below 30 — the palette has no alert-red hue).
 
 The score is a weighted blend of three independently computed components:
 
@@ -277,7 +278,8 @@ def _score_thermal(
         component.score = _clamp(score)
         component.available = True
         component.quality = _clamp(
-            (climatology.years_covered / 10.0) * (1.0 if buoy and buoy.is_usable else 0.82),
+            (climatology.years_covered / max(1, climatology.years_requested))
+            * (1.0 if buoy and buoy.is_usable else 0.82),
             0.0,
             1.0,
         )

@@ -19,6 +19,7 @@ service at all.
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -54,8 +55,10 @@ def marine_query_variants(query: str) -> list[str]:
     return [f"{place} {noun}"]
 
 NOMINATIM_URL: Final[str] = "https://nominatim.openstreetmap.org/search"
+#: Nominatim requires a real contact in the User-Agent; see api_clients.CONTACT.
 USER_AGENT: Final[str] = (
-    "MarineEcosystemHealthIndex/1.0 (location search; contact via project repository)"
+    "MarineEcosystemHealthIndex/1.0 (location search; "
+    f"{os.getenv('MEHI_CONTACT', 'letterstofranco@gmail.com')})"
 )
 MIN_INTERVAL_SECONDS: Final[float] = 1.1  # Nominatim asks for <= 1 req/sec.
 
@@ -176,22 +179,33 @@ def geocode(query: str, *, limit: int = 5, timeout: float = 20.0) -> list[Geocod
     if not query:
         return []
 
-    _throttle()
-    try:
-        response = httpx.get(
-            NOMINATIM_URL,
-            params={
-                "q": query,
-                "format": "jsonv2",
-                "limit": max(1, min(limit, 10)),
-                "addressdetails": 0,
-            },
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-            timeout=timeout,
-            follow_redirects=True,
-        )
-    except httpx.HTTPError as exc:
-        raise GeocodingError(f"geocoder unreachable: {type(exc).__name__}") from exc
+    # One retry on transport failure: a single dropped connection should not
+    # surface as "geocoder unreachable". The throttle inside the loop keeps the
+    # retry honest against Nominatim's 1 req/sec policy.
+    last_exc: httpx.HTTPError | None = None
+    response = None
+    for attempt in range(2):
+        _throttle()
+        try:
+            response = httpx.get(
+                NOMINATIM_URL,
+                params={
+                    "q": query,
+                    "format": "jsonv2",
+                    "limit": max(1, min(limit, 10)),
+                    "addressdetails": 0,
+                },
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                timeout=timeout,
+                follow_redirects=True,
+            )
+            break
+        except httpx.HTTPError as exc:
+            last_exc = exc
+    if response is None:
+        raise GeocodingError(
+            f"geocoder unreachable: {type(last_exc).__name__}"
+        ) from last_exc
 
     if response.status_code != 200:
         raise GeocodingError(f"geocoder returned HTTP {response.status_code}")

@@ -165,7 +165,10 @@ def _fidelity() -> None:
         "OISST bars == years covered (<=10)": bars == years_covered and 1 <= bars <= 10,
         "log grid columns": "140px 140px 160px 70px 80px 80px 30px" in css,
         "6 stat tiles": body.count('class="tm-tile"') == 6,
-        "15 stat rows": body.count('class="tm-statrow"') == 15,
+        # 16, not the handoff's 15: a "Taxa sampled for mix" row was added so
+        # the phylum percentages are not read as the region's full composition
+        # (they are computed over the top-N checklist sample).
+        "16 stat rows": body.count('class="tm-statrow"') == 16,
         "12 hbar rows": body.count('class="tm-hrow"') == 12,
         # Expandable detail drawers (native <details>), from live data.
         "detail drawers present": 5 <= body.count("<details") <= 7,

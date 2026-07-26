@@ -14,6 +14,8 @@ Colour use follows the project palette: CANOPY for primary marks, SIGNAL
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import altair as alt
 import numpy as np
 import pandas as pd
@@ -21,7 +23,7 @@ import streamlit as st
 
 from ml_analysis import AnalysisReport, DatasetProfile
 from ui import (
-    CANOPY, LINE, MIST, PAPER, SIGNAL,
+    CANOPY, LINE, MIST, PANEL, PAPER, SIGNAL,
     fmt, kv_rows, metric_box, panel_title, style_chart,
 )
 
@@ -31,8 +33,112 @@ __all__ = [
     "render_structure",
     "render_anomalies",
     "render_inventory",
+    "render_export",
     "render_footer",
 ]
+
+
+def _slope_units(unit: str | None, per: str) -> str:
+    """Label for a rate. Without a known unit the label must still read as a
+    rate: ``"/year".strip("/")`` produced the bare word "year", which names the
+    denominator as if it were the quantity being measured."""
+    return f"{unit}/{per}" if unit else f"per {per}"
+
+
+def _parameter_table(report: AnalysisReport) -> pd.DataFrame:
+    """One row per analysed parameter — the report's headline numbers, flat.
+
+    This is the shape people actually want in a spreadsheet; the JSON export
+    carries the full nested report for anyone who needs everything.
+    """
+    rows = []
+    for p in report.parameters:
+        trend, season, changes = p.trend, p.seasonality, p.changepoints
+        rows.append(
+            {
+                "column": p.column,
+                "parameter": p.canonical_parameter or "",
+                "unit": p.unit or "",
+                "n": p.n,
+                "mean": p.mean,
+                "median": p.median,
+                "std": p.std,
+                "min": p.minimum,
+                "max": p.maximum,
+                "trend_available": trend.available,
+                "trend_direction": trend.direction,
+                "trend_significant": trend.significant,
+                "theil_sen_slope": trend.theil_sen_slope,
+                "theil_sen_low": trend.theil_sen_low,
+                "theil_sen_high": trend.theil_sen_high,
+                "slope_units": _slope_units(p.unit, trend.per),
+                "ols_slope": trend.ols_slope,
+                "ols_stderr": trend.ols_stderr,
+                "ols_p": trend.ols_p,
+                "ols_r2": trend.ols_r2,
+                "mk_tau": trend.mk_tau,
+                "mk_p_adjusted": trend.mk_p_adjusted,
+                "effective_n": trend.effective_n,
+                "seasonally_adjusted": trend.seasonally_adjusted,
+                "raw_ols_slope": trend.raw_ols_slope,
+                "total_change": trend.total_change,
+                "seasonality_detected": season.detected,
+                "period_days": season.period_used_days,
+                "period_label": season.period_label or "",
+                "changepoints": len(changes.changepoint_indices),
+                "segment_means": " -> ".join(f"{m:.6g}" for m in changes.segment_means),
+                "robust_outliers": p.robust_outliers,
+                "robust_outlier_fraction": p.robust_outlier_fraction,
+                "unavailable_reason": trend.reason or "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_export(profile: DatasetProfile, report: AnalysisReport) -> None:
+    """Download controls for the computed report.
+
+    Everything offered here is already computed and on screen — the exports are
+    the same numbers, not a re-derivation.
+    """
+    panel_title("EXPORT RESULTS")
+    stem = Path(profile.filename or "dataset").stem[:48] or "dataset"
+    stamp = report.computed_at.strftime("%Y%m%dT%H%M%SZ")
+
+    table = _parameter_table(report)
+    left, middle, right = st.columns(3)
+    with left:
+        st.download_button(
+            "PARAMETER RESULTS (CSV)",
+            data=table.to_csv(index=False),
+            file_name=f"{stem}_parameters_{stamp}.csv",
+            mime="text/csv",
+            disabled=table.empty,
+            use_container_width=True,
+        )
+    with middle:
+        st.download_button(
+            "FULL REPORT (JSON)",
+            data=report.model_dump_json(indent=2),
+            file_name=f"{stem}_report_{stamp}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    with right:
+        anomalies = report.anomalies
+        anomaly_csv = (
+            pd.DataFrame(anomalies.top_anomalies).to_csv(index=False)
+            if anomalies.top_anomalies
+            else ""
+        )
+        st.download_button(
+            "FLAGGED ANOMALIES (CSV)",
+            data=anomaly_csv,
+            file_name=f"{stem}_anomalies_{stamp}.csv",
+            mime="text/csv",
+            disabled=not anomaly_csv,
+            use_container_width=True,
+        )
 
 
 def render_summary(
@@ -173,12 +279,29 @@ def render_parameter(
                     .encode(x="x:T", y="value:Q")
                 )
 
-            if temporal and analysis.changepoints.changepoints:
+            changepoints = analysis.changepoints
+            if temporal and changepoints.changepoints:
                 layers = layers + (
-                    alt.Chart(pd.DataFrame({"x": analysis.changepoints.changepoints}))
+                    alt.Chart(pd.DataFrame({"x": changepoints.changepoints}))
                     .mark_rule(color=SIGNAL, strokeWidth=1.2, strokeDash=[3, 2])
                     .encode(x="x:T")
                 )
+                # Mean level of each regime segment, drawn between its
+                # boundaries so a shift reads as a step, not just a rule.
+                if len(changepoints.segment_means) == len(changepoints.changepoints) + 1:
+                    bounds = [plot["x"].min(), *changepoints.changepoints, plot["x"].max()]
+                    seg_df = pd.DataFrame(
+                        {
+                            "x": bounds[:-1],
+                            "x2": bounds[1:],
+                            "value": changepoints.segment_means,
+                        }
+                    )
+                    layers = layers + (
+                        alt.Chart(seg_df)
+                        .mark_rule(color=PAPER, strokeWidth=1.0, opacity=0.7)
+                        .encode(x="x:T", x2="x2:T", y="value:Q")
+                    )
 
             if temporal and analysis.outlier_timestamps:
                 merged = pd.DataFrame({"x": analysis.outlier_timestamps}).merge(
@@ -192,6 +315,30 @@ def render_parameter(
                     )
 
             st.altair_chart(style_chart(layers), use_container_width=True)
+
+            # The chart carries up to four mark types in two accent colours,
+            # which no single Altair legend expresses cleanly — spell the key
+            # out beneath it, showing only the marks actually drawn.
+            key_parts = [f'<span style="color:{CANOPY}">━ series</span>']
+            if temporal and trend.available and trend.theil_sen_slope is not None:
+                key_parts.append(f'<span style="color:{SIGNAL}">╌ trend</span>')
+            if temporal and analysis.changepoints.changepoints:
+                key_parts.append(
+                    f'<span style="color:{SIGNAL}">┊ regime shift</span>'
+                )
+                if analysis.changepoints.segment_means:
+                    key_parts.append(
+                        f'<span style="color:{PAPER}">─ segment mean</span>'
+                    )
+            if temporal and analysis.outlier_timestamps:
+                key_parts.append(f'<span style="color:{SIGNAL}">● outlier</span>')
+            st.markdown(
+                '<div style="font-size:10px;color:' + MIST + ';display:flex;'
+                'gap:16px;flex-wrap:wrap;margin:-6px 0 4px 2px">'
+                + "".join(key_parts)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
 
     with stat_col:
         trend = analysis.trend
@@ -207,7 +354,7 @@ def render_parameter(
             rows.append(("unit (assumed)", analysis.unit, "c"))
 
         if trend.available:
-            unit_label = f"{analysis.unit or ''}/{trend.per}".strip("/")
+            unit_label = _slope_units(analysis.unit, trend.per)
             rows.extend(
                 [
                     ("trend direction", trend.direction.upper(),
@@ -218,6 +365,8 @@ def render_parameter(
                      f"[{fmt(trend.theil_sen_low, '+.5g')}, "
                      f"{fmt(trend.theil_sen_high, '+.5g')}]", "v"),
                     ("OLS slope", f"{fmt(trend.ols_slope, '+.5g')} {unit_label}", "v"),
+                    ("  std error", fmt(trend.ols_stderr, ".3g"), "v"),
+                    ("  p", fmt(trend.ols_p, ".3g"), "v"),
                     ("  r squared", fmt(trend.ols_r2, ".4f"), "v"),
                     ("Mann-Kendall tau", fmt(trend.mk_tau, ".4f"), "v"),
                     ("  p (raw)", fmt(trend.mk_p, ".3g"), "v"),
@@ -241,6 +390,11 @@ def render_parameter(
                 [
                     ("periodicity", "DETECTED" if season.detected else "none resolved",
                      "c" if season.detected else "v"),
+                    *(
+                        [("  cycle identified", season.period_label, "c")]
+                        if season.period_label
+                        else []
+                    ),
                     ("dominant period", f"{fmt(season.dominant_period_days, '.2f')} d", "v"),
                     ("  period used", f"{fmt(season.period_used_days, '.2f')} d", "v"),
                     ("  ACF peak / threshold",
@@ -259,6 +413,13 @@ def render_parameter(
                  if analysis.changepoints.available
                  else (analysis.changepoints.reason or "unavailable"),
                  "w" if analysis.changepoints.changepoint_indices else "v"),
+                *(
+                    [("  segment means",
+                      " -> ".join(f"{m:.4g}" for m in analysis.changepoints.segment_means),
+                      "v")]
+                    if analysis.changepoints.segment_means
+                    else []
+                ),
                 ("robust outliers",
                  f"{analysis.robust_outliers:,} ({analysis.robust_outlier_fraction:.2%})",
                  "w" if analysis.robust_outliers else "v"),
@@ -304,7 +465,7 @@ def render_structure(report: AnalysisReport) -> None:
                             # Amber for negative, canopy for positive: the same
                             # two accents used everywhere else.
                             scale=alt.Scale(domain=[-1, 0, 1],
-                                            range=[SIGNAL, "#16231b", CANOPY]),
+                                            range=[SIGNAL, PANEL, CANOPY]),
                         ),
                         tooltip=["a:N", "b:N", alt.Tooltip("rho:Q", format=".3f")],
                     )
@@ -379,6 +540,39 @@ def render_structure(report: AnalysisReport) -> None:
 
         clusters = report.clusters
         if clusters.available:
+            if clusters.labels:
+                # Regime membership over sample order: where the dataset sits
+                # in each k-means regime and when it switches. Sample order is
+                # used (not timestamps) because labels are aligned to the rows
+                # that survived the complete-case filter.
+                regime_df = pd.DataFrame(
+                    {
+                        "sample": np.arange(len(clusters.labels)),
+                        "regime": [f"R{label + 1}" for label in clusters.labels],
+                    }
+                )
+                # One lane per regime, so membership is separable by *position*
+                # and not by colour alone — CANOPY and MIST sit too close to
+                # carry the distinction by themselves. Colour is kept as a
+                # redundant cue, reordered so the regimes seen first (k is
+                # usually 2-3) get the most distinct hues.
+                n_regimes = max(1, len(set(clusters.labels)))
+                strip = (
+                    alt.Chart(regime_df)
+                    .mark_tick(thickness=2, size=14)
+                    .encode(
+                        x=alt.X("sample:Q", title="sample order"),
+                        y=alt.Y("regime:N", title=None, sort="ascending"),
+                        color=alt.Color(
+                            "regime:N", title="regime",
+                            scale=alt.Scale(range=[SIGNAL, CANOPY, PAPER, MIST]),
+                            legend=None,
+                        ),
+                        tooltip=["sample:Q", "regime:N"],
+                    )
+                    .properties(height=22 * n_regimes + 20)
+                )
+                st.altair_chart(style_chart(strip), use_container_width=True)
             st.markdown(
                 kv_rows(
                     [
@@ -417,6 +611,32 @@ def render_anomalies(report: AnalysisReport) -> None:
     ordered = [c for c in ("row", "timestamp", "score", "flagged") if c in table.columns]
     ordered += [c for c in table.columns if c not in ordered]
     st.dataframe(table[ordered], use_container_width=True, height=260, hide_index=True)
+
+    if anomalies.scores and len(anomalies.flagged_mask) == len(anomalies.scores):
+        # Full score distribution, not just the top rows: shows whether the
+        # flagged set is a distinct tail or an arbitrary cut through the bulk.
+        # Pair each score with flagged_mask, NOT flagged_indices — the latter
+        # indexes the original frame, so positions diverge as soon as the
+        # complete-case filter drops a row.
+        score_df = pd.DataFrame({"score": anomalies.scores})
+        score_df["status"] = [
+            "flagged" if f else "normal" for f in anomalies.flagged_mask
+        ]
+        hist = (
+            alt.Chart(score_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("score:Q", bin=alt.Bin(maxbins=40), title="isolation score"),
+                y=alt.Y("count():Q", title="rows"),
+                color=alt.Color(
+                    "status:N", title=None,
+                    scale=alt.Scale(domain=["normal", "flagged"],
+                                    range=[CANOPY, SIGNAL]),
+                ),
+            )
+            .properties(height=120)
+        )
+        st.altair_chart(style_chart(hist), use_container_width=True)
     st.markdown(
         kv_rows(
             [

@@ -17,7 +17,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-OFFLINE = ["test_ml_analysis", "test_regions", "test_geocoding", "test_data_access"]
+OFFLINE = [
+    "test_ml_analysis", "test_regions", "test_geocoding", "test_data_access",
+    "test_analyzer", "test_transport", "test_render", "test_layout",
+]
 LIVE = ["test_app"]
 
 

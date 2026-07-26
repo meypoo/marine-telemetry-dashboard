@@ -16,25 +16,47 @@ cache and fallback path as a built-in region.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 import streamlit as st
 
 from api_clients import REGIONS, Region
-from data_access import CACHE_TTL_SECONDS, load_region
+from data_access import CACHE_TTL_SECONDS, load_history, load_region
 from geocoding import (
     GeocodeResult, GeocodingError, geocode, marine_query_variants, parse_latlon,
 )
 from terminal_render import (
-    location_subtitle, render_body, render_footer, render_topbar_left,
+    location_subtitle, render_alert_banner, render_body, render_comparison,
+    render_footer, render_topbar_left,
 )
 from ui import (
     CANOPY, LINE, PAPER_DIM, SIGNAL, TerminalConfig, esc,
     inject_terminal_css, safe_page_link,
 )
 
+logger = logging.getLogger(__name__)
+
 config = TerminalConfig.from_query_params()
 inject_terminal_css(config)
+
+#: Score at or above which the page raises an alert. Defaults to the amber
+#: threshold used by ``ui.stress_accent`` and the CRITICAL band, overridable
+#: with ``?alert=<score>``.
+DEFAULT_ALERT_THRESHOLD = 70.0
+
+
+def _alert_threshold() -> float:
+    try:
+        raw = st.query_params.get("alert")
+    except Exception:  # outside a script run context
+        return DEFAULT_ALERT_THRESHOLD
+    if raw is None:
+        return DEFAULT_ALERT_THRESHOLD
+    try:
+        return max(0.0, min(100.0, float(str(raw))))
+    except (TypeError, ValueError):
+        return DEFAULT_ALERT_THRESHOLD
 
 #: Default is the data cache TTL plus a margin, so each timed rerun pulls fresh
 #: data rather than re-rendering the same cached snapshot. Overridable with
@@ -119,6 +141,38 @@ def _resolve_location(
     return Region.from_point(best.short_name, best.latitude, best.longitude), "search", note
 
 
+def _previous_score(history: list[dict], current: float | None) -> float | None:
+    """The score recorded *before* the current one, or None.
+
+    ``_append_history`` only records a point every 30 minutes, so the newest
+    entry is sometimes this load's reading and sometimes an earlier one. An
+    entry counts as "this load" when it was written in the last minute and
+    carries the current score.
+    """
+    if not history:
+        return None
+    entries = list(history)
+    now = datetime.now(timezone.utc)
+    try:
+        newest = entries[-1]
+        written = datetime.fromisoformat(newest["at"])
+        just_recorded = (
+            (now - written).total_seconds() < 60.0
+            and current is not None
+            and abs(float(newest["score"]) - current) < 1e-9
+        )
+    except (KeyError, TypeError, ValueError):
+        just_recorded = False
+
+    candidates = entries[:-1] if just_recorded else entries
+    for entry in reversed(candidates):
+        try:
+            return float(entry["score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
 def _banner(text: str, colour: str) -> None:
     st.markdown(
         '<div class="tm-root"><div style="padding:8px 32px;'
@@ -156,21 +210,35 @@ def _render() -> None:
 
     # Controls are rendered first so their values are known; the title column is
     # filled in last, once the location is resolved, so its subtitle can name it.
-    title_col, search_col, region_col, refresh_col, nav_col = st.columns(
-        [0.40, 0.24, 0.15, 0.11, 0.10]
-    )
+    (
+        title_col, search_col, region_col, compare_col, refresh_col, nav_col
+    ) = st.columns([0.34, 0.20, 0.14, 0.14, 0.09, 0.09])
     with search_col:
         search_text = st.text_input(
             "SEARCH",
             key="location_search",
             placeholder="place name or lat, lon",
             label_visibility="collapsed",
+            help=(
+                "A place name, or a raw 'lat, lon' pair such as "
+                "'36.75, -122.0'. Coordinates are the reliable route for "
+                "offshore points — geocoders index the open ocean poorly. "
+                "A first load for a new location takes a few moments."
+            ),
         )
     with region_col:
         selected_name = st.selectbox(
             "REGION", options=[r.name for r in REGIONS], index=0,
             label_visibility="collapsed",
             help="Built-in regions. Type in the search box to go anywhere else.",
+        )
+    with compare_col:
+        compare_name = st.selectbox(
+            "COMPARE",
+            options=["COMPARE: OFF", *[r.name for r in REGIONS]],
+            index=0,
+            label_visibility="collapsed",
+            help="Show a second region's score beside this one.",
         )
     with refresh_col:
         if st.button("REFRESH", use_container_width=True):
@@ -180,8 +248,15 @@ def _render() -> None:
         safe_page_link("page_lab.py", "DATA LAB")
 
     curated = next(r for r in REGIONS if r.name == selected_name)
-    region, source, note = _resolve_location(search_text, curated)
-    result = load_region(region, st.session_state.nonce)
+    # A cold load blocks for tens of seconds (Overpass dominates). Without this
+    # the page renders its controls and then appears frozen with an empty body,
+    # which reads as a hang rather than as work in progress.
+    with st.spinner(
+        "Resolving location and fetching live feeds — a first load for a new "
+        "location takes a few moments; cached locations are instant."
+    ):
+        region, source, note = _resolve_location(search_text, curated)
+        result = load_region(region, st.session_state.nonce)
     coverage = result.snapshot.marine_coverage if result.ok else "unknown"
 
     with title_col:
@@ -250,11 +325,85 @@ def _render() -> None:
             SIGNAL,
         )
 
+    # History is read before the alert so the alert can say which way the score
+    # moved. The newest entry is the reading this load just recorded — but only
+    # if it actually appended: _append_history is rate-limited, which at the
+    # normal refresh cadence is the common case. Decide by timestamp rather than
+    # assuming, or "the previous reading" quotes a two-ago value.
+    history = load_history(region.code)
+    previous = _previous_score(history, result.assessment.score)
+
+    threshold = _alert_threshold()
+    alert = render_alert_banner(result.assessment, threshold, previous)
+    if alert:
+        st.markdown(alert, unsafe_allow_html=True)
+        # Also recorded so an unattended overnight run leaves a trace in logs/.
+        logger.warning(
+            "ALERT %s: stress score %.1f (%s) >= threshold %.0f",
+            region.name, result.assessment.score, result.assessment.band, threshold,
+        )
+
+    comparison = ""
+    if compare_name != "COMPARE: OFF" and compare_name != region.name:
+        compare_region = next(r for r in REGIONS if r.name == compare_name)
+        compare_result = load_region(compare_region, st.session_state.nonce)
+        if compare_result.ok:
+            comparison = render_comparison(
+                result.assessment, compare_result.assessment,
+                other_stale=compare_result.stale,
+            )
+
     st.markdown(
-        render_body(result.snapshot, result.assessment, config, stale=result.stale),
+        render_body(
+            result.snapshot, result.assessment, config, stale=result.stale,
+            history=history, comparison=comparison,
+        ),
         unsafe_allow_html=True,
     )
+    _render_export(result, history)
     st.markdown(render_footer(), unsafe_allow_html=True)
+
+
+def _render_export(result, history: list[dict]) -> None:
+    """Download controls for the current assessment, snapshot and history.
+
+    The assessment and snapshot are Pydantic models, so the export is the same
+    data the dashboard rendered — not a re-derivation.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    code = result.snapshot.region.filesystem_code
+    left, middle, right, _spacer = st.columns([0.16, 0.16, 0.16, 0.52])
+    with left:
+        st.download_button(
+            "EXPORT ASSESSMENT",
+            data=result.assessment.model_dump_json(indent=2),
+            file_name=f"assessment_{code}_{stamp}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    with middle:
+        st.download_button(
+            "EXPORT SNAPSHOT",
+            data=result.snapshot.model_dump_json(indent=2),
+            file_name=f"snapshot_{code}_{stamp}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    with right:
+        rows = ["recorded_at,score,band,confidence"]
+        for entry in history:
+            rows.append(
+                f"{entry.get('at', '')},{entry.get('score', '')},"
+                f"{entry.get('band', '')},{entry.get('confidence', '')}"
+            )
+        st.download_button(
+            "EXPORT HISTORY",
+            data="\n".join(rows) + "\n",
+            file_name=f"history_{code}_{stamp}.csv",
+            mime="text/csv",
+            disabled=not history,
+            use_container_width=True,
+        )
 
 
 terminal()

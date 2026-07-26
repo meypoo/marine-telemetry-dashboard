@@ -14,17 +14,20 @@ than substituting a placeholder.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
 from analyzer import StressAssessment
 from api_clients import BuoySnapshot, Region, RegionSnapshot
 from ui import (
     BORDER_STRONG, CANOPY, INK, LINE, MIST, PAPER, PAPER_DIM, SIGNAL,
-    SOURCE_COLOURS, TerminalConfig, esc, fmt,
+    SOURCE_COLOURS, TerminalConfig, esc, fmt, gloss_attr, stress_accent,
 )
 
-__all__ = ["render_topbar_left", "location_subtitle", "render_body", "render_footer"]
+__all__ = [
+    "render_topbar_left", "location_subtitle", "render_body", "render_footer",
+    "render_alert_banner", "render_comparison",
+]
 SOURCES_LINE = (
     "SOURCES: NOAA ERDDAP coastwatch.pfeg.noaa.gov (cwwcNDBCMet in-situ buoy, "
     "ncdcOisst21Agg OISST v2.1 day-of-year baseline) · Open-Meteo Marine "
@@ -60,7 +63,8 @@ def _row(key: str, value: str, *, colour: str = PAPER, small_key: bool = False,
     key_class = "k sm" if small_key else "k"
     value_class = "v md" if medium_value else "v"
     return (
-        f'<div class="tm-row"><span class="{key_class}">{esc(key)}</span>'
+        f'<div class="tm-row"><span class="{key_class}"{gloss_attr(key)}>'
+        f'{esc(key)}</span>'
         f'<span class="{value_class}" style="color:{colour}">{esc(value)}</span></div>'
     )
 
@@ -126,18 +130,6 @@ def _detail_rows(pairs: Sequence[tuple[str, str]]) -> str:
     return "".join(out)
 
 
-def _nice_ceiling(value: float, divisions: int = 4) -> float:
-    """Round a scale maximum up to something that divides cleanly."""
-    if value <= 0:
-        return float(divisions)
-    magnitude = 10 ** math.floor(math.log10(value))
-    for multiplier in (1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10):
-        candidate = magnitude * multiplier
-        if candidate >= value:
-            return float(candidate)
-    return float(magnitude * 10)
-
-
 # --------------------------------------------------------------------------- #
 # SVG charts
 # --------------------------------------------------------------------------- #
@@ -165,8 +157,20 @@ def _line_chart(
     baseline: float | None,
     width: int = 1000,
     height: int = 220,
+    x_fractions: list[list[float] | None] | None = None,
+    dashed: Sequence[bool] | None = None,
 ) -> tuple[str, list[float]]:
-    """Multi-series line chart. Returns (svg, y_tick_values)."""
+    """Multi-series line chart. Returns (svg, y_tick_values).
+
+    ``x_fractions`` optionally gives each series its own horizontal positions on
+    0-1 instead of even index spacing. Two series only share an x-axis honestly
+    when they are positioned on a common domain — evenly spacing series of
+    different time spans silently stretches the shorter one across the longer
+    one's window.
+
+    ``dashed`` marks a series as a dashed stroke, so two lines stay
+    distinguishable without introducing a third accent colour.
+    """
     finite = [v for _, _, values in series for v in values if v is not None]
     if not finite:
         return (
@@ -189,21 +193,34 @@ def _line_chart(
         f'preserveAspectRatio="none">'
     ]
     if baseline is not None:
+        # MIST, not BORDER_STRONG: this line is the interpretive anchor of the
+        # chart and BORDER_STRONG sits at 1.9:1 on INK, below the 3:1 minimum
+        # for meaningful non-text marks — it was effectively invisible.
         parts.append(
             f'<line x1="0" y1="{y_of(baseline):.1f}" x2="{width}" '
-            f'y2="{y_of(baseline):.1f}" stroke="{BORDER_STRONG}" stroke-width="1" '
+            f'y2="{y_of(baseline):.1f}" stroke="{MIST}" stroke-width="1" '
             f'stroke-dasharray="5,5"/>'
         )
-    for _, colour, values in series:
-        coords = [
-            f"{i / max(1, len(values) - 1) * width:.1f},{y_of(float(v)):.1f}"
-            for i, v in enumerate(values)
-            if v is not None
-        ]
+    for index, (_, colour, values) in enumerate(series):
+        xs = None
+        if x_fractions is not None and index < len(x_fractions):
+            xs = x_fractions[index]
+        coords = []
+        for i, v in enumerate(values):
+            if v is None:
+                continue
+            if xs is not None and i < len(xs):
+                x = xs[i] * width
+            else:
+                x = i / max(1, len(values) - 1) * width
+            coords.append(f"{x:.1f},{y_of(float(v)):.1f}")
         if len(coords) >= 2:
+            stroke_dash = ""
+            if dashed is not None and index < len(dashed) and dashed[index]:
+                stroke_dash = ' stroke-dasharray="6,4"'
             parts.append(
                 f'<polyline points="{" ".join(coords)}" fill="none" stroke="{colour}" '
-                f'stroke-width="2"/>'
+                f'stroke-width="2"{stroke_dash}/>'
             )
     parts.append("</svg>")
 
@@ -212,23 +229,33 @@ def _line_chart(
 
 
 def _bar_chart(years: list[int], values: list[float], threshold: float | None) -> str:
-    """Vertical bars in a 130px track with an overlaid amber threshold line."""
+    """Vertical bars in a 130px track with an overlaid amber threshold line.
+
+    The scale is anchored just below the smallest value rather than at zero:
+    yearly SST means differ by tenths of a degree, and on a zero-based scale
+    every bar renders at ~90% height and the differences vanish.
+    """
     if not values:
         return f'<div class="tm-mist" style="font-size:11.5px">baseline unavailable</div>'
 
-    scale_max = _nice_ceiling(max([*values, threshold or 0]) * 1.05)
+    bounds = [*values, *( [threshold] if threshold is not None else [] )]
+    scale_min = min(bounds) - 0.5
+    scale_max = max(bounds) + 0.5
+    span = scale_max - scale_min
+
     bars = "".join(
-        f'<div class="tm-bar" style="height:{max(2.0, v / scale_max * 130):.1f}px" '
+        f'<div class="tm-bar" '
+        f'style="height:{max(2.0, (v - scale_min) / span * 130):.1f}px" '
         f'title="{y}: {v:.2f} degC"></div>'
         for y, v in zip(years, values)
     )
     line = ""
     if threshold is not None:
-        offset = min(130.0, max(0.0, threshold / scale_max * 130))
+        offset = min(130.0, max(0.0, (threshold - scale_min) / span * 130))
         line = f'<div class="tm-threshold" style="bottom:{offset:.1f}px"></div>'
 
     ticks = "".join(
-        f"<div>{scale_max * i / 4:.0f}</div>" for i in range(4, -1, -1)
+        f"<div>{scale_min + span * i / 4:.1f}</div>" for i in range(4, -1, -1)
     )
     labels = "".join(f"<div>{y}</div>" for y in years)
     return (
@@ -251,7 +278,8 @@ def _hbars(
         pct = 0.0 if max_value <= 0 else min(100.0, magnitude / max_value * 100.0)
         rows.append(
             '<div class="tm-hrow">'
-            f'<div class="tm-hlabel" style="width:{label_width}px">{esc(label)}</div>'
+            f'<div class="tm-hlabel" style="width:{label_width}px" '
+            f'title="{esc(label)}">{esc(label)}</div>'
             f'<div class="tm-htrack"><div class="tm-hfill" style="width:{pct:.1f}%"></div></div>'
             f'<div class="tm-hvalue">{esc(display)}</div>'
             "</div>"
@@ -265,10 +293,13 @@ def _hbars(
 def render_topbar_left(config: TerminalConfig, subtitle: str, stamp: str) -> str:
     """Title block: fixed product name over a location-specific subtitle and the
     UTC timestamp. The title never wraps (nowrap) so a narrow column cannot
-    shatter it across several lines."""
+    shatter it across several lines; overflow-hidden + ellipsis stop it bleeding
+    into the neighbouring search column when its own column gets narrower than
+    the text."""
     return (
         f'<div style="padding:{config.pad_outer}px 0 16px 32px">'
-        '<div style="white-space:nowrap"><span class="tm-live"></span>'
+        '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
+        '<span class="tm-live"></span>'
         '<span class="tm-title">MARINE ECOSYSTEM HEALTH INDEX</span></div>'
         f'<div class="tm-subtitle">{esc(subtitle)}</div>'
         f'<div class="tm-stamp" style="margin-top:3px;line-height:1.4">{esc(stamp)}</div>'
@@ -373,13 +404,26 @@ def _sidebar(
     score = assessment.score
     sea_state = snapshot.sea_state
     spark_values = [v for v in (sea_state.sst_c if sea_state else []) if v is not None]
+    thermal = assessment.component("thermal")
+    thermal_available = bool(thermal and thermal.available)
 
     status = f"{assessment.band} · {'STALE' if stale else 'LIVE'}"
     hero = (
         '<div>'
         + _chip("STRESS SCORE")
-        + f'<div class="tm-hero-num">{fmt(score, ".1f")}</div>'
+        + f'<div class="tm-hero-num" style="color:{stress_accent(score)}">'
+        f'{fmt(score, ".1f")}</div>'
+        # The product is a "Health Index" but this number is stress, so the
+        # scale's direction is stated on the face rather than left to be
+        # inferred from the band words (a bare "LOW" reads equally as low
+        # health). Confidence sits here too: a 0.0 from two dead components
+        # would otherwise be indistinguishable from a pristine reading.
+        + f'<div class="tm-mist" style="font-size:10px;letter-spacing:0.08em;'
+        f'margin:-4px 0 8px 0">0 = UNDISTURBED · 100 = SEVERE · HIGHER IS WORSE'
+        f'</div>'
         + _chip(status, large=True)
+        + f'<div class="tm-mist" style="font-size:10.5px;margin-top:6px">'
+        f"confidence {assessment.confidence:.0%}</div>"
         + f'<div style="margin-top:12px">{_sparkline(spark_values)}</div>'
         "</div>"
     )
@@ -399,6 +443,15 @@ def _sidebar(
             derivation.append(
                 _row(component.label.title(), "excluded", colour=SIGNAL)
             )
+            # Say *why* on the face of the panel. The reason previously lived
+            # only inside a collapsed drawer, leaving "excluded" and a reduced
+            # confidence figure with nothing connecting them.
+            if component.unavailable_reason:
+                derivation.append(
+                    '<div class="tm-mist" style="font-size:10.5px;'
+                    'margin:-2px 0 6px 0;padding-left:2px">'
+                    f"{esc(component.unavailable_reason)}</div>"
+                )
     derivation.append(
         _row("Ecological Stress Score", fmt(score, ".1f"), colour=SIGNAL)
     )
@@ -412,18 +465,35 @@ def _sidebar(
     metrics = [
         _row("Sea surface temp", fmt(assessment.current_sst_c, ".2f", " °C"),
              small_key=True, medium_value=True),
+        # Amber alone would carry the "elevated" meaning for a reader who does
+        # not perceive the colour; a text marker rides alongside it.
         _row("Anomaly vs 10y baseline",
-             fmt(anomaly, "+.2f", " °C"),
+             fmt(anomaly, "+.2f", " °C") + (" ▲" if (anomaly or 0) > 0.5 else ""),
              colour=SIGNAL if (anomaly or 0) > 0.5 else PAPER,
              small_key=True, medium_value=True),
-        _row("Anomaly (sigma)", fmt(sigma, "+.2f"),
+        _row("Anomaly (sigma)",
+             fmt(sigma, "+.2f") + (" ▲" if (sigma or 0) >= 1.29 else ""),
              colour=SIGNAL if (sigma or 0) >= 1.29 else PAPER,
              small_key=True, medium_value=True),
-        _row("Decadal trend", fmt(assessment.trend_c_per_decade, "+.2f", " °C/dec"),
+        # The point estimate must never appear without its uncertainty: a
+        # ten-point regression routinely produces physically implausible slopes,
+        # which is exactly why scoring uses the lower bound instead.
+        _row("Decadal trend",
+             (
+                 f"{assessment.trend_c_per_decade:+.2f} "
+                 f"± {assessment.trend_stderr_c_per_decade:.2f} °C/dec"
+                 if assessment.trend_c_per_decade is not None
+                 and assessment.trend_stderr_c_per_decade is not None
+                 else fmt(assessment.trend_c_per_decade, "+.2f", " °C/dec")
+             ),
              small_key=True, medium_value=True),
         _row("Trend scored", fmt(assessment.trend_scored_c_per_decade, ".2f", " °C/dec"),
              small_key=True, medium_value=True),
-        _row("Marine heatwave", "ACTIVE" if assessment.marine_heatwave else "None",
+        # "None" would assert a determination that was never made when thermal
+        # scoring was excluded; only claim it when the baseline supported it.
+        _row("Marine heatwave",
+             ("ACTIVE" if assessment.marine_heatwave else "None")
+             if thermal_available else "--",
              colour=SIGNAL if assessment.marine_heatwave else PAPER,
              small_key=True, medium_value=True),
         _row("Baseline mean", fmt(assessment.baseline_mean_c, ".2f", " °C"),
@@ -433,7 +503,9 @@ def _sidebar(
              small_key=True, medium_value=True),
         _row("Species observed", f"{obis.species:,}" if obis else "--",
              small_key=True, medium_value=True),
-        _row("Confidence", f"{assessment.confidence:.0%}",
+        _row("Confidence",
+             f"{assessment.confidence:.0%}"
+             + ("" if assessment.confidence >= 0.75 else " reduced"),
              colour=PAPER if assessment.confidence >= 0.75 else SIGNAL,
              small_key=True, medium_value=True),
     ]
@@ -453,7 +525,9 @@ def _sidebar(
             _row("Air temperature", fmt(buoy.air_temp_c, ".1f", " °C"), small_key=True),
             _row("Wind speed", fmt(buoy.wind_speed_ms, ".1f", " m/s"), small_key=True),
             _row("Wave height", fmt(buoy.wave_height_m, ".1f", " m"), small_key=True),
-            _row("Observation age", fmt(buoy.age_hours, ".1f", " h"),
+            _row("Observation age",
+                 fmt(buoy.age_hours, ".1f", " h")
+                 + (" stale" if (buoy.age_hours or 0) >= 6 else ""),
                  colour=PAPER if (buoy.age_hours or 0) < 6 else SIGNAL, small_key=True),
             _row("Distance from centroid", fmt(buoy.distance_km, ".0f", " km"),
                  small_key=True),
@@ -483,27 +557,91 @@ def _sst_panel(snapshot: RegionSnapshot, assessment: StressAssessment,
     sea_state = snapshot.sea_state
     buoy = snapshot.buoy
 
-    model = _downsample([v for v in (sea_state.sst_c if sea_state else [])], 24)
-    in_situ = _downsample(list(buoy.history_wtmp_c) if buoy else [], 24)
+    # The two series cover different windows — the model returns ~6 days, the
+    # buoy history 48 h — so they must be positioned on a SHARED time domain.
+    # Spacing both evenly across the panel would stretch the 48 h buoy trace
+    # across the model's six days, making the in-situ/model cross-check (the
+    # entire point of this panel) a comparison of unlike instants.
+    model_values = _downsample(
+        [v for v in (sea_state.sst_c if sea_state else [])], 24
+    )
+    model_times = _downsample(list(sea_state.times) if sea_state else [], 24)
+    in_situ_values = _downsample(list(buoy.history_wtmp_c) if buoy else [], 24)
+    in_situ_times = _downsample(list(buoy.history_times) if buoy else [], 24)
 
-    times = _downsample(list(sea_state.times) if sea_state else [], 24)
-    labels = [t.strftime("%m-%d %Hh") for t in times] if times else []
+    stamps = [t for t in (*model_times, *in_situ_times) if t is not None]
+    domain_start = min(stamps) if stamps else None
+    domain_end = max(stamps) if stamps else None
+    total_seconds = (
+        (domain_end - domain_start).total_seconds()
+        if domain_start is not None and domain_end is not None
+        else 0.0
+    )
+
+    def fractions_for(times: list) -> list[float] | None:
+        """Map timestamps onto 0-1 of the shared domain."""
+        if not times or total_seconds <= 0 or domain_start is None:
+            return None
+        return [
+            (t - domain_start).total_seconds() / total_seconds
+            if t is not None else 0.0
+            for t in times
+        ]
 
     series: list[tuple[str, str, list[float | None]]] = []
-    if any(v is not None for v in in_situ):
-        series.append(("in-situ", CANOPY, in_situ))
-    if any(v is not None for v in model):
-        series.append(("model", MIST, model))
+    x_fractions: list[list[float] | None] = []
+    dashed: list[bool] = []
+    if any(v is not None for v in in_situ_values):
+        series.append(("in-situ", CANOPY, in_situ_values))
+        # Only trust the buoy's own timestamps when they pair with the values;
+        # otherwise fall back to even spacing rather than inventing instants.
+        x_fractions.append(
+            fractions_for(in_situ_times)
+            if len(in_situ_times) == len(in_situ_values) else None
+        )
+        dashed.append(False)
+    if any(v is not None for v in model_values):
+        series.append(("model", MIST, model_values))
+        x_fractions.append(
+            fractions_for(model_times)
+            if len(model_times) == len(model_values) else None
+        )
+        # Dashed so the two green-family lines stay separable without adding a
+        # third accent to a deliberately two-accent palette.
+        dashed.append(True)
 
-    svg, ticks = _line_chart(series, assessment.baseline_mean_c)
+    svg, ticks = _line_chart(
+        series, assessment.baseline_mean_c,
+        x_fractions=x_fractions, dashed=dashed,
+    )
     tick_html = "".join(f"<div>{t:.1f}</div>" for t in ticks)
+
+    # Labels are spaced evenly by flexbox, so they must mark evenly spaced
+    # *times* across the shared domain, not sampled instants.
+    label_count = 6
+    if domain_start is not None and total_seconds > 0:
+        labels = [
+            (domain_start + timedelta(seconds=total_seconds * i / (label_count - 1)))
+            .strftime("%m-%d %Hh")
+            for i in range(label_count)
+        ]
+    elif domain_start is not None:
+        labels = [domain_start.strftime("%m-%d %Hh")]
+    else:
+        labels = []
     label_html = "".join(f"<div>{esc(l)}</div>" for l in labels)
 
     station = buoy.station if buoy and buoy.station else "—"
+    in_situ_span = ""
+    if in_situ_times and total_seconds > 0:
+        covered = (max(in_situ_times) - min(in_situ_times)).total_seconds() / 3600.0
+        in_situ_span = f" · {covered:.0f}h window"
     legend = (
         '<div class="tm-legend">'
-        f'<span style="color:{CANOPY}">● NDBC {esc(station)} in-situ</span>'
-        f'<span style="color:{MIST}">● Open-Meteo model</span>'
+        f'<span style="color:{CANOPY}">━ NDBC {esc(station)} in-situ'
+        f"{esc(in_situ_span)}</span>"
+        f'<span style="color:{MIST}">╌ Open-Meteo model</span>'
+        f'<span style="color:{MIST}">╌ 10y baseline</span>'
         "</div>"
     )
     body = (
@@ -552,11 +690,24 @@ def _sst_panel(snapshot: RegionSnapshot, assessment: StressAssessment,
 def _baseline_panel(snapshot: RegionSnapshot, assessment: StressAssessment) -> str:
     climatology = snapshot.climatology
     if climatology is None or not climatology.yearly_means:
+        # Distinguish a failed fetch from a successful one that returned no
+        # data — the same distinction marine_coverage draws between "unknown"
+        # and "none". Reporting a retrieval failure for a landlocked point is
+        # simply untrue, and sends the reader looking for an outage.
+        if climatology is None:
+            reason = "NOAA OISST baseline could not be retrieved (fetch failed)"
+        else:
+            reason = (
+                "NOAA OISST returned no sea-surface temperature for this point "
+                "in any of the baseline years — expected on land or outside "
+                "ocean coverage, not a fetch failure"
+            )
         return (
             "<section>"
             + _chip("OISST DAY-OF-YEAR BASELINE — UNAVAILABLE", block=True)
             + '<div class="tm-mist" style="font-size:11.5px;margin-top:8px">'
-            "NOAA OISST baseline could not be retrieved</div></section>"
+            + esc(reason)
+            + "</div></section>"
         )
     years = list(climatology.yearly_means)
     values = list(climatology.yearly_means.values())
@@ -669,7 +820,10 @@ def _composition_panels(snapshot: RegionSnapshot) -> str:
     return (
         '<div style="display:flex;gap:24px">'
         '<section style="flex:1;min-width:0">'
-        + _chip("OBIS BIODIVERSITY — PHYLUM COMPOSITION", block=True)
+        # Named as a sample, because that is what it is: the shares below are
+        # computed over the top-N taxa checklist, not over the region's full
+        # occurrence record count shown in the stats strip.
+        + _chip("OBIS BIODIVERSITY — PHYLUM MIX (TOP-TAXA SAMPLE)", block=True)
         + f'<div style="margin-top:10px">{_hbars(bio_items, 120, bio_max)}</div>'
         + obis_drawer
         + "</section>"
@@ -691,7 +845,8 @@ def _stats_strip(snapshot: RegionSnapshot, assessment: StressAssessment,
 
     def stat(key: str, value: str) -> str:
         return (
-            f'<div class="tm-statrow"><span class="k">{esc(key)}</span>'
+            f'<div class="tm-statrow"><span class="k"{gloss_attr(key)}>'
+            f'{esc(key)}</span>'
             f'<span class="v">{esc(value)}</span></div>'
         )
 
@@ -701,9 +856,11 @@ def _stats_strip(snapshot: RegionSnapshot, assessment: StressAssessment,
         stat("Contributing datasets", f"{obis.datasets:,}" if obis else "--"),
         stat("Temporal range",
              f"{obis.year_min}–{obis.year_max}" if obis and obis.year_min else "--"),
+        stat("Taxa sampled for mix",
+             f"{obis.checklist_sampled:,} of {obis.taxa:,}" if obis else "--"),
         stat("Weighted sensitivity", fmt(detail.get("weighted_sensitivity"), ".3f")),
         stat("Assemblage evenness", fmt(detail.get("evenness"), ".3f")),
-        stat("Dominant phylum",
+        stat("Dominant phylum (in sample)",
              f"{detail.get('dominant_phylum', '--')} "
              f"({fmt(detail.get('dominant_share'), '.1%')})"),
     ]
@@ -714,8 +871,12 @@ def _stats_strip(snapshot: RegionSnapshot, assessment: StressAssessment,
         stat("Bounding-box area", f"{region.area_km2:,.0f} km²"),
         stat("Seamark density",
              f"{infra.density_per_1000km2:.2f} / 1000 km²" if infra else "--"),
+        # "0 of 0" would read as "no routing features" when in fact the tag
+        # query failed and composition is simply unknown.
         stat("Routing / berthing",
-             f"{infra.traffic_features:,} of {infra.sampled_elements:,}" if infra else "--"),
+             (f"{infra.traffic_features:,} of {infra.sampled_elements:,}"
+              if infra.sampled_elements else "tag sample unavailable")
+             if infra else "--"),
         stat("Baseline years", str(climatology.years_covered) if climatology else "--"),
         stat("Baseline observations",
              f"{climatology.observations:,}" if climatology else "--"),
@@ -743,13 +904,18 @@ def _console(snapshot: RegionSnapshot) -> str:
     total_bytes = sum(e.payload_bytes for e in events)
     failed = sum(1 for e in events if not e.ok)
 
+    # WALL CLOCK is this cycle's live-tier fetch; the request/latency/payload
+    # tiles span the merged telemetry of both tiers, so a cached context feed
+    # from hours ago is counted there but not in the wall clock. The captions
+    # say which is which so "REQUESTS 14 / WALL CLOCK 1.5s" is not read as a
+    # contradiction.
     tiles = [
-        ("REQUESTS", str(len(events)), f"{failed} failed"),
-        ("WALL CLOCK", f"{snapshot.duration_ms / 1000:.2f}s", "concurrent fetch"),
-        ("LATENCY P50", f"{pct(50):.0f}ms", "per request"),
-        ("LATENCY P95", f"{pct(95):.0f}ms", "per request"),
-        ("PAYLOAD", f"{total_bytes / 1024:.1f} KB", "decoded bytes"),
-        ("FETCHED", f"{snapshot.fetched_at:%H:%M:%S}Z", "UTC"),
+        ("REQUESTS", str(len(events)), f"both tiers · {failed} failed"),
+        ("WALL CLOCK", f"{snapshot.duration_ms / 1000:.2f}s", "live tier this cycle"),
+        ("LATENCY P50", f"{pct(50):.0f}ms", "across all feeds"),
+        ("LATENCY P95", f"{pct(95):.0f}ms", "across all feeds"),
+        ("PAYLOAD", f"{total_bytes / 1024:.1f} KB", "all feeds decoded"),
+        ("FETCHED", f"{snapshot.fetched_at:%H:%M:%S}Z", "live tier, UTC"),
     ]
     tile_html = "".join(
         f'<div class="tm-tile"><div class="l">{esc(l)}</div>'
@@ -794,6 +960,200 @@ def _console(snapshot: RegionSnapshot) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Score history
+# --------------------------------------------------------------------------- #
+def _history_panel(history: Sequence[dict]) -> str:
+    """Recorded stress score over time, with its full log in a drawer.
+
+    Unlike every other panel this one is not derived from the current fetch: it
+    reads the append-only history the cache keeps, so it is the only view that
+    shows whether a region is getting worse rather than how it is right now.
+    """
+    parsed: list[tuple[datetime, float]] = []
+    for entry in history:
+        try:
+            parsed.append(
+                (datetime.fromisoformat(entry["at"]), float(entry["score"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    # Sorted because the chart maps time to horizontal position; an out-of-order
+    # line (or a negative window) would otherwise be drawn as fact.
+    parsed.sort(key=lambda pair: pair[0])
+    stamps = [p[0] for p in parsed]
+    points = [p[1] for p in parsed]
+
+    head = (
+        f'<div class="tm-panelhead"><div>{_chip("STRESS SCORE HISTORY")}</div>'
+        '<div class="tm-legend">'
+        f'<span style="color:{MIST}">● one point per scored load, at most one '
+        "per 30 min</span>"
+        "</div></div>"
+    )
+
+    if len(points) < 2:
+        return (
+            f"<section>{head}"
+            '<div class="tm-mist" style="font-size:11.5px">'
+            "collecting — a trend appears once this location has been scored at "
+            "least twice (roughly one point per half hour of running)."
+            "</div></section>"
+        )
+
+    first, last = points[0], points[-1]
+    delta = last - first
+    span_hours = (stamps[-1] - stamps[0]).total_seconds() / 3600.0
+    span = f"{span_hours:.1f} h" if span_hours < 48 else f"{span_hours / 24:.1f} d"
+
+    # Position each point by *when* it was recorded, not by its ordinal. History
+    # accrues irregularly (only while a tab is open), so index spacing would draw
+    # an hour-long jump and a week-long drift as the same slope.
+    origin = stamps[0].timestamp()
+    total = stamps[-1].timestamp() - origin
+    fractions = (
+        [(s.timestamp() - origin) / total for s in stamps]
+        if total > 0
+        else [i / max(1, len(stamps) - 1) for i in range(len(stamps))]
+    )
+    svg, ticks = _line_chart(
+        [("score", CANOPY, [*points])], None, height=120, x_fractions=[fractions]
+    )
+    tick_html = "".join(f"<div>{t:.0f}</div>" for t in ticks)
+    # The label row is spaced evenly by flexbox, so its labels must be evenly
+    # spaced in *time* to sit under the right part of the line — the sampled
+    # instants are irregular and would not line up.
+    label_count = 4
+    label_html = "".join(
+        f'<div>{esc(datetime.fromtimestamp(origin + total * i / (label_count - 1), tz=timezone.utc).strftime("%m-%d %Hh"))}</div>'
+        for i in range(label_count)
+    )
+
+    summary = "".join(
+        [
+            _row("Points recorded", f"{len(points):,}", small_key=True),
+            _row("Window", span, small_key=True),
+            _row("First / latest", f"{first:.1f} → {last:.1f}", small_key=True),
+            _row("Change", f"{delta:+.1f}",
+                 colour=SIGNAL if delta > 0 else CANOPY, small_key=True),
+            _row("Peak / floor", f"{max(points):.1f} / {min(points):.1f}",
+                 small_key=True),
+        ]
+    )
+
+    log = _mini_table(
+        [("recorded (UTC)", False), ("score", True), ("band", False),
+         ("confidence", True)],
+        [
+            [
+                entry.get("at", "")[:19].replace("T", " "),
+                fmt(entry.get("score"), ".1f"),
+                str(entry.get("band", "")),
+                fmt(entry.get("confidence"), ".0%"),
+            ]
+            for entry in list(history)[-40:][::-1]
+        ],
+    )
+
+    return (
+        f"<section>{head}"
+        '<div class="tm-chartrow"><div class="tm-yaxis" style="height:120px">'
+        f"{tick_html}</div>{svg}</div>"
+        f'<div class="tm-xaxis">{label_html}</div>'
+        f'<div style="margin-top:10px">{summary}</div>'
+        + _drawer("FULL RECORDED HISTORY", log)
+        + "</section>"
+    )
+
+
+def render_alert_banner(assessment: StressAssessment, threshold: float,
+                        previous: float | None) -> str:
+    """Amber alert row shown when the score is at or above ``threshold``.
+
+    Uses the one amber accent like every other warning — there is no alert-red
+    in this palette. Returns an empty string when nothing has crossed.
+    """
+    score = assessment.score
+    if score is None or score < threshold:
+        return ""
+    if previous is None:
+        movement = "no previous reading recorded"
+    else:
+        delta = score - previous
+        if abs(delta) < 0.05:
+            movement = f"unchanged from the previous reading ({previous:.1f})"
+        else:
+            direction = "up" if delta > 0 else "down"
+            movement = (
+                f"{direction} {abs(delta):.1f} from the previous reading "
+                f"({previous:.1f})"
+            )
+    # Threshold is user-settable via ?alert=, so it may carry a decimal; :g
+    # keeps 70 as "70" without rounding 72.5 down to "72".
+    return (
+        '<div class="tm-root"><div style="padding:8px 32px;'
+        f'border-bottom:1px solid {LINE};font-size:11.5px;color:{SIGNAL}">'
+        f"ALERT: stress score {score:.1f} ({esc(assessment.band)}) is at or above "
+        f"the {threshold:g} threshold — {esc(movement)}. "
+        "Higher scores mean more stress."
+        "</div></div>"
+    )
+
+
+def render_comparison(
+    primary: StressAssessment,
+    other: StressAssessment,
+    *,
+    other_stale: bool = False,
+) -> str:
+    """Compact A/B strip comparing two regions' scores side by side."""
+    def cell(assessment: StressAssessment, tag: str) -> str:
+        score = assessment.score
+        colour = stress_accent(score)  # the 70/30 rule lives in ui, not here
+        value = fmt(score, ".1f")
+        return (
+            '<div class="tm-statcol">'
+            f'<div class="tm-seclabel">{esc(tag)}</div>'
+            f'<div style="font-size:26px;font-weight:700;color:{colour};'
+            f'line-height:1.2">{esc(value)}</div>'
+            f'<div class="tm-mist" style="font-size:11.5px">'
+            f"{esc(assessment.region_name)} · {esc(assessment.band)} · "
+            f"confidence {assessment.confidence:.0%}</div>"
+            "</div>"
+        )
+
+    if primary.score is not None and other.score is not None:
+        delta = primary.score - other.score
+        verdict = (
+            f"{esc(primary.region_name)} is {abs(delta):.1f} points "
+            f"{'more' if delta > 0 else 'less'} stressed"
+            if abs(delta) >= 0.05
+            else "both regions score the same"
+        )
+        delta_colour = SIGNAL if delta > 0 else CANOPY
+    else:
+        delta = None
+        verdict = "one region has no score, so the two are not comparable"
+        delta_colour = MIST
+
+    stale_note = " · comparison from cached data" if other_stale else ""
+    return (
+        '<section><div class="tm-panelhead">'
+        f'<div>{_chip("REGION COMPARISON")}</div>'
+        f'<div class="tm-legend"><span style="color:{MIST}">'
+        f"{esc(verdict)}{esc(stale_note)}</span></div></div>"
+        '<div class="tm-stats" style="border-top:none;padding-top:0">'
+        + cell(primary, "THIS LOCATION")
+        + cell(other, "COMPARED WITH")
+        + '<div class="tm-statcol">'
+        + '<div class="tm-seclabel">DIFFERENCE</div>'
+        + f'<div style="font-size:26px;font-weight:700;color:{delta_colour};'
+        + f'line-height:1.2">{esc(fmt(delta, "+.1f"))}</div>'
+        + '<div class="tm-mist" style="font-size:11.5px">stress points</div>'
+        + "</div></div></section>"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Assembly
 # --------------------------------------------------------------------------- #
 def render_body(
@@ -802,6 +1162,8 @@ def render_body(
     config: TerminalConfig,
     *,
     stale: bool = False,
+    history: Sequence[dict] | None = None,
+    comparison: str = "",
 ) -> str:
     """Full dashboard body: sidebar plus main column."""
     region = snapshot.region
@@ -809,8 +1171,12 @@ def render_body(
         _sst_panel(snapshot, assessment, region),
         _baseline_panel(snapshot, assessment),
         _composition_panels(snapshot),
-        _stats_strip(snapshot, assessment, region),
     ]
+    if comparison:
+        main_sections.append(comparison)
+    if history is not None:
+        main_sections.append(_history_panel(history))
+    main_sections.append(_stats_strip(snapshot, assessment, region))
     if config.show_console:
         main_sections.append(_console(snapshot))
 

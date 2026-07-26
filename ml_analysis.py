@@ -441,7 +441,16 @@ class AnomalyResult(BaseModel):
     n_anomalies: int = 0
     fraction: float = 0.0
     samples_used: int = 0
+    #: Isolation score per *scored sample*, in matrix order (rows that survived
+    #: the complete-case filter). Lower = more anomalous.
     scores: list[float] = Field(default_factory=list)
+    #: Parallel to ``scores``: whether that sample was flagged. Kept alongside
+    #: the scores because ``flagged_indices`` below is in a *different* index
+    #: space, and pairing a score with a flag by position is otherwise wrong
+    #: whenever the complete-case filter dropped a row.
+    flagged_mask: list[bool] = Field(default_factory=list)
+    #: Flagged rows as positions in the *original frame*, for lookups against
+    #: the uploaded data. Not an index into ``scores``.
     flagged_indices: list[int] = Field(default_factory=list)
     top_anomalies: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -1033,6 +1042,7 @@ def _analyze_anomalies(
         result.n_anomalies = int(flagged.size)
         result.fraction = round(float(flagged.size) / float(scaled.shape[0]), 4)
         result.scores = [round(float(s), 5) for s in scores]
+        result.flagged_mask = [bool(p == -1) for p in predictions]
         result.flagged_indices = [int(positions[i]) for i in flagged]
 
         order = np.argsort(scores)[: min(15, scores.size)]

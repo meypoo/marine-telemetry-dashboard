@@ -1,0 +1,71 @@
+# Reverse proxy for the Marine Ecosystem Health dashboard.
+#
+# What this gives you that a raw Streamlit port does not:
+#   - TLS termination (Streamlit speaks plain HTTP; never expose it directly)
+#   - HTTP Basic authentication (the app itself has no auth)
+#   - WebSocket upgrade for Streamlit's /_stcore/stream (required, or the app
+#     loads then hangs with "Please wait...")
+#   - a few conservative security headers
+#
+# Streamlit must be reachable from nginx but NOT from the internet. Run it bound
+# to localhost (streamlit run app.py --server.address 127.0.0.1) or, in Docker,
+# on an internal network with only 443 published.
+#
+# Setup:
+#   1. Create the password file (repeat -c omitted to add more users):
+#        htpasswd -c /etc/nginx/.htpasswd yourname
+#   2. Obtain a certificate, e.g.:
+#        certbot --nginx -d dashboard.example.com
+#   3. Replace dashboard.example.com and the cert paths below, then reload nginx.
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    server_name dashboard.example.com;
+    # Force TLS.
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name dashboard.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/dashboard.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dashboard.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # Conservative security headers. HSTS is commented out until you are sure
+    # every subdomain is HTTPS — it is hard to undo.
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+    # add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # The dashboard fetches ~70 KB per cold load; a searched location can take
+    # 20 s server-side. Generous timeouts avoid 504s on a legitimate slow fetch.
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+
+    location / {
+        auth_basic           "Marine Ecosystem Health";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+
+        proxy_pass http://127.0.0.1:8501;
+        proxy_http_version 1.1;
+
+        # WebSocket upgrade — Streamlit's live channel rides on this.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

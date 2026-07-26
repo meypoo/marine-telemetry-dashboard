@@ -25,10 +25,11 @@ import streamlit as st
 
 __all__ = [
     "INK", "PAPER", "PAPER_DIM", "MIST", "LINE", "BORDER_STRONG", "SIGNAL", "CANOPY",
+    "PANEL",
     "SOURCE_COLOURS", "TerminalConfig",
     "inject_base_css", "inject_terminal_css",
     "metric_box", "panel_title", "kv_rows", "fmt", "style_chart", "command_bar",
-    "safe_page_link", "stress_accent", "esc",
+    "safe_page_link", "stress_accent", "esc", "gloss_attr",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -42,6 +43,13 @@ LINE = "#22362B"           # hairline dividers
 BORDER_STRONG = "#2f4a3a"  # pills, dashed reference line
 SIGNAL = "#E4B34A"         # amber: label chips, alerts, warnings
 CANOPY = "#3E8F62"         # primary accent: chart line, bars, in-situ legend
+PANEL = "#16231b"          # raised-panel fill: tiles, bar tracks, dropzone
+
+
+def _rgba(hex_colour: str, alpha: float) -> str:
+    """Derive an rgba() from a palette hex so tints track their token."""
+    r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+    return f"rgba({r},{g},{b},{alpha})"
 
 #: Per-API colouring for the transport log. NOAA ERDDAP rows are amber per the
 #: handoff; the rest fall back across the remaining palette.
@@ -160,7 +168,7 @@ def _base_css(config: TerminalConfig) -> str:
      "REFRESH" into vertical fragments in a narrow column. */
   .stButton > button * {{ white-space: nowrap !important; word-break: keep-all !important;
       overflow-wrap: normal !important; }}
-  .stButton > button:hover {{ background: rgba(228,179,74,0.12); color: {SIGNAL}; }}
+  .stButton > button:hover {{ background: {_rgba(SIGNAL, 0.12)}; color: {SIGNAL}; }}
   .stButton > button:focus {{ box-shadow: none; color: {SIGNAL}; }}
 
   /* Inputs fill their column. */
@@ -183,7 +191,7 @@ def _base_css(config: TerminalConfig) -> str:
   a[data-testid="stPageLink-NavLink"]:hover {{ color: {SIGNAL} !important; }}
 
   section[data-testid="stFileUploaderDropzone"] {{
-      border: 1px dashed {CANOPY}; background: #16231b; padding: 8px;
+      border: 1px dashed {CANOPY}; background: {PANEL}; padding: 8px;
   }}
   section[data-testid="stFileUploaderDropzone"] button,
   section[data-testid="stFileUploaderDropzone"] button * {{
@@ -193,7 +201,7 @@ def _base_css(config: TerminalConfig) -> str:
 
   /* --- shared primitives --- */
   .mx-bar {{
-      border: 1px solid {BORDER_STRONG}; background: #16231b;
+      border: 1px solid {BORDER_STRONG}; background: {PANEL};
       padding: 6px 10px; margin-bottom: 6px;
       display: flex; justify-content: space-between; align-items: center;
       letter-spacing: 0.10em;
@@ -202,7 +210,7 @@ def _base_css(config: TerminalConfig) -> str:
   .mx-bar .r {{ color: {MIST}; font-size: 10.5px; }}
 
   .mx-box {{
-      border: 1px solid {LINE}; background: #16231b; padding: 8px 10px; height: 100%;
+      border: 1px solid {LINE}; background: {PANEL}; padding: 8px 10px; height: 100%;
       display: flex; flex-direction: column; justify-content: space-between;
   }}
   .mx-label {{
@@ -210,7 +218,8 @@ def _base_css(config: TerminalConfig) -> str:
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }}
   .mx-value {{ font-size: 19px; font-weight: 700; line-height: 1.2; margin: 2px 0; }}
-  .mx-sub {{ color: {MIST}; font-size: 10.5px; }}
+  .mx-sub {{ color: {MIST}; font-size: 10.5px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 
   .mx-panel-title {{
       color: {SIGNAL}; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
@@ -268,7 +277,9 @@ def _terminal_css(config: TerminalConfig) -> str:
 
   /* --- chips and section headers --- */
   .tm-chip {{ background: {SIGNAL}; color: {INK}; font-size: 10px; font-weight: 700;
-      padding: 3px 8px; display: inline-block; letter-spacing: 0.04em; }}
+      padding: 3px 8px; display: inline-block; letter-spacing: 0.04em;
+      max-width: 100%; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis; vertical-align: bottom; }}
   .tm-chip.lg {{ font-size: 11.5px; }}
   .tm-chip.bar {{ display: block; }}
   .tm-seclabel {{ color: {SIGNAL}; font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
@@ -284,19 +295,28 @@ def _terminal_css(config: TerminalConfig) -> str:
       padding: 6px 0; border-bottom: 1px solid {LINE}; gap: 12px; }}
   .tm-row:last-child {{ border-bottom: none; }}
   .tm-row .k {{ color: {MIST}; font-size: 12px; }}
+  /* A dotted underline marks a term that has a hover gloss. */
+  .tm-row .k[title], .tm-statrow .k[title], .mx-kv .k[title] {{
+      text-decoration: underline dotted {LINE}; text-underline-offset: 3px;
+      cursor: help; }}
   .tm-row .k.sm {{ font-size: 11.5px; }}
   .tm-row .v {{ font-size: 12px; font-weight: 600; text-align: right; }}
   .tm-row .v.md {{ font-size: 12.5px; }}
 
   /* --- panels --- */
-  .tm-legend {{ display: flex; gap: 18px; align-items: center; font-size: 11.5px; }}
+  .tm-legend {{ display: flex; gap: 18px; align-items: center; font-size: 11.5px;
+      flex-shrink: 0; }}
   .tm-panelhead {{ display: flex; justify-content: space-between; align-items: center;
       gap: 16px; margin-bottom: 10px; }}
+  /* The chip side must be allowed to shrink so a long searched-region name
+     ellipsizes instead of wrapping the amber chip to a second line. */
+  .tm-panelhead > div:first-child {{ min-width: 0; }}
   .tm-yaxis {{ display: flex; flex-direction: column; justify-content: space-between;
       font-size: 10.5px; color: {MIST}; text-align: right; width: 30px;
       padding-right: 4px; }}
   .tm-xaxis {{ display: flex; justify-content: space-between; font-size: 10px;
       color: {MIST}; padding-left: 34px; margin-top: 6px; }}
+  .tm-xaxis > div {{ white-space: nowrap; }}
   .tm-chartrow {{ display: flex; align-items: stretch; }}
 
   /* --- bar chart --- */
@@ -308,26 +328,35 @@ def _terminal_css(config: TerminalConfig) -> str:
 
   /* --- horizontal bar rows --- */
   .tm-hrow {{ display: flex; align-items: center; gap: 10px; padding: 3.5px 0; }}
-  .tm-hlabel {{ font-size: 11.5px; color: {MIST}; text-align: right; }}
-  .tm-htrack {{ flex: 1; background: #16231b; height: 15px; }}
+  .tm-hlabel {{ font-size: 11.5px; color: {MIST}; text-align: right;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      flex-shrink: 0; }}
+  .tm-htrack {{ flex: 1; background: {PANEL}; height: 15px; }}
   .tm-hfill {{ background: {CANOPY}; height: 15px; }}
   .tm-hvalue {{ width: 40px; font-size: 11px; color: {PAPER_DIM}; text-align: right; }}
 
   /* --- expandable detail drawers (native <details>, no JS) --- */
-  .tm-drawer {{ margin-top: 8px; border-top: 1px solid {LINE}; }}
+  /* Bordered and slightly inset so the summary reads as a clickable control,
+     not a section label — a lot of the honest caveat detail lives in here and
+     it was previously easy to miss. */
+  .tm-drawer {{ margin-top: 8px; border: 1px solid {LINE}; }}
   .tm-drawer > summary {{ cursor: pointer; list-style: none; color: {SIGNAL};
-      font-size: 9.5px; letter-spacing: 0.14em; text-transform: uppercase;
-      padding: 6px 0 4px 0; user-select: none; }}
+      font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+      padding: 7px 10px; user-select: none; background: {PANEL}; }}
   .tm-drawer > summary::-webkit-details-marker {{ display: none; }}
   .tm-drawer > summary::before {{ content: "\\25B8  "; }}
   .tm-drawer[open] > summary::before {{ content: "\\25BE  "; }}
+  .tm-drawer[open] > summary {{ border-bottom: 1px solid {LINE}; }}
+  .tm-drawer > summary::after {{ content: " ▸ click to expand"; color: {MIST};
+      font-size: 8.5px; letter-spacing: 0.04em; text-transform: none; }}
+  .tm-drawer[open] > summary::after {{ content: ""; }}
   .tm-drawer > summary:hover {{ color: {PAPER}; }}
-  .tm-drawer-body {{ padding: 4px 0 10px 0; overflow-x: auto; }}
+  .tm-drawer-body {{ padding: 8px 10px 10px 10px; overflow-x: auto; }}
   .tm-mini {{ width: 100%; border-collapse: collapse; font-size: 10.5px; }}
   .tm-mini th {{ color: {MIST}; text-align: left; font-weight: 400;
       padding: 3px 12px 3px 0; border-bottom: 1px solid {LINE}; white-space: nowrap; }}
   .tm-mini td {{ color: {PAPER}; padding: 2px 12px 2px 0;
-      border-bottom: 1px solid #16231b; white-space: nowrap; }}
+      border-bottom: 1px solid {PANEL}; white-space: nowrap; }}
   .tm-mini td.num, .tm-mini th.num {{ text-align: right; color: {PAPER_DIM}; }}
   .tm-mini td.name {{ color: {CANOPY}; }}
 
@@ -349,6 +378,7 @@ def _terminal_css(config: TerminalConfig) -> str:
   .tm-tile .c {{ color: {MIST}; font-size: 10.5px; }}
   .tm-log {{ display: grid; grid-template-columns: 140px 140px 160px 70px 80px 80px 30px;
       gap: 14px; font-size: 11.5px; padding: 3px 0; }}
+  .tm-log > div {{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   .tm-log.head {{ font-size: 10px; color: {MIST}; letter-spacing: 0.08em;
       border-bottom: 1px solid {LINE}; padding-bottom: 6px; margin-bottom: 6px; }}
 
@@ -361,6 +391,13 @@ def _terminal_css(config: TerminalConfig) -> str:
   .tm-mist {{ color: {MIST}; }}
   .tm-paper {{ color: {PAPER}; }}
   .tm-dim {{ color: {PAPER_DIM}; }}
+
+  /* Below the common 1440/1280 laptop widths the fixed sidebar is the only
+     element that can push the whole page into horizontal scroll; let it give
+     up a little width before that happens. */
+  @media (max-width: 1280px) {{
+      .tm-side {{ width: 320px; min-width: 320px; }}
+  }}
 </style>
 """
 
@@ -401,12 +438,66 @@ def panel_title(text: str) -> None:
     st.markdown(f'<div class="mx-panel-title">{esc(text)}</div>', unsafe_allow_html=True)
 
 
+#: Plain-language glosses for the specialist terms the dashboard prints, keyed
+#: by a lowercase substring of the row label. Surfaced as a hover ``title`` so a
+#: non-specialist can read the dashboard without leaving it; the terms are not
+#: dumbed down on the face, only explained on hover.
+GLOSSARY: dict[str, str] = {
+    "oisst": "NOAA's satellite+in-situ blended daily sea-surface temperature "
+             "record, back to 1981 — the source of the 10-year baseline.",
+    "theil-sen": "A trend slope estimated from the median of all pairwise "
+                 "slopes; robust to outliers, unlike ordinary least squares.",
+    "mann-kendall": "A rank-based test for whether a monotonic trend is "
+                    "present, not assuming the data are normally distributed.",
+    "seamark": "A charted maritime feature (buoys, beacons, routing lanes, "
+               "berths) from OpenSeaMap — the vessel-pressure signal.",
+    "silhouette": "How well-separated the clusters are, from -1 to 1; used to "
+                  "pick the number of regimes k.",
+    "loading": "How strongly each original parameter contributes to a "
+               "principal component.",
+    "isolation": "Isolation Forest score: how few random splits it takes to "
+                 "isolate a row. Lower means more anomalous.",
+    "effective sample": "The sample size adjusted down for autocorrelation — "
+                        "consecutive readings are not independent.",
+    "sigma": "Standard deviations from the baseline mean; ~1.3σ is the 90th "
+             "percentile of a normal distribution.",
+    "evenness": "How evenly the assemblage is spread across phyla (Shannon "
+                "evenness); low means one group dominates.",
+    "p90": "The 90th percentile of the 10-year baseline for this day of year.",
+    "autocorrelation": "Correlation of the series with a lagged copy of itself "
+                       "— how much each reading predicts the next.",
+    "changepoint": "A point where the series' mean level shifts abruptly, "
+                   "found by binary segmentation.",
+    "regime": "A distinct operating state the data cluster into (k-means).",
+    "spearman": "Rank correlation: monotonic association, robust to outliers.",
+    "pearson": "Linear correlation between two parameters.",
+    "weighted sensitivity": "The assemblage's exposure to warming/acidification,"
+                            " weighted by phylum — susceptibility, not observed "
+                            "decline.",
+    "contamination": "The expected fraction of anomalies, which sets the "
+                     "Isolation Forest's flagging threshold.",
+}
+
+
+def gloss_attr(label: str) -> str:
+    """A ``title=`` attribute if the label contains a known jargon term."""
+    low = label.lower()
+    for term, definition in GLOSSARY.items():
+        if term in low:
+            return f' title="{esc(definition)}"'
+    return ""
+
+
+_gloss_attr = gloss_attr  # internal alias
+
+
 def kv_rows(rows: list[tuple[str, str, str]]) -> str:
-    """Key/value block. Each row is (key, value, css_class)."""
+    """Key/value block. Each row is (key, value, css_class). Known jargon in the
+    key gets a hover gloss automatically."""
     out = ['<div class="mx-kv">']
     for key, value, cls in rows:
         out.append(
-            f'<div><span class="k">{esc(key)}</span>'
+            f'<div><span class="k"{_gloss_attr(key)}>{esc(key)}</span>'
             f'<span class="{cls}">{esc(value)}</span></div>'
         )
     out.append("</div>")
@@ -471,7 +562,7 @@ def style_chart(chart: alt.Chart) -> alt.Chart:
         chart.configure(background=INK)
         .configure_view(strokeWidth=0)
         .configure_axis(
-            labelColor=PAPER_DIM, titleColor=MIST, gridColor="#16231b",
+            labelColor=PAPER_DIM, titleColor=MIST, gridColor=PANEL,
             domainColor=LINE, tickColor=LINE, labelFontSize=9, titleFontSize=9,
             labelFont="Space Mono, monospace", titleFont="Space Mono, monospace",
         )

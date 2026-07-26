@@ -35,29 +35,41 @@ cycle. A cold miss of both tiers runs them back to back, a small, rare cost.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
 from analyzer import StressAssessment, assess_region
 from api_clients import (
     REGIONS_BY_CODE, FeedBundle, Region, RegionSnapshot, fetch_feeds,
+    snapshot_from_bundle,
 )
 
-__all__ = ["LoadResult", "load_region", "CACHE_TTL_SECONDS"]
+__all__ = [
+    "LoadResult", "load_region", "load_history", "CACHE_TTL_SECONDS",
+    "HISTORY_RETENTION_DAYS",
+]
+
+logger = logging.getLogger(__name__)
 
 #: Feeds that change fast (minutes-hours): re-fetched on every timed refresh.
 DYNAMIC_FEEDS = ("buoy", "sea_state")
 #: Feeds that are stable within a day: fetched roughly once per UTC day.
 CONTEXT_FEEDS = ("climatology", "obis", "infrastructure")
 
-#: TTLs matched to volatility.
-DYNAMIC_TTL = 600            # 10 minutes
-CONTEXT_TTL = 86_400         # 24 hours (the date key does the real invalidation)
+#: TTLs matched to volatility; overridable for deployments with different
+#: refresh economics (values in seconds). The context tier's real invalidation
+#: is its date key — the long TTL is a memory-bound backstop.
+DYNAMIC_TTL = int(os.getenv("MEHI_DYNAMIC_TTL", "600"))     # 10 minutes
+CONTEXT_TTL = int(os.getenv("MEHI_CONTEXT_TTL", "86400"))   # 24 hours
 
 #: Back-compat alias — the dynamic tier's TTL is the "freshness" the UI tracks.
 CACHE_TTL_SECONDS = DYNAMIC_TTL
@@ -71,6 +83,35 @@ CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 #: In-process last-known-good, keyed by region code. Survives reruns and
 #: cache expiry; lost on restart, which is what the disk mirror covers.
 _LAST_GOOD: dict[str, tuple[RegionSnapshot, StressAssessment]] = {}
+
+#: Retry generation for the context tier, keyed by region code:
+#: ``(generation, last_bump_monotonic)``. The generation is part of the context
+#: cache key, so bumping it forces a re-fetch. Without this, a transient
+#: OISST/OBIS/Overpass failure at the first fetch of a UTC day would be cached
+#: as a degraded bundle until the date rolled over. Bumps are spaced at least
+#: ``DYNAMIC_TTL`` apart so a persistent outage is re-tried once per refresh
+#: cycle, not hammered on every page load.
+_CONTEXT_RETRY: dict[str, tuple[int, float]] = {}
+
+
+def _context_generation(code: str) -> int:
+    return _CONTEXT_RETRY.get(code, (0, 0.0))[0]
+
+
+def _schedule_context_retry(code: str, context: FeedBundle) -> None:
+    """Arrange a context re-fetch next cycle if any context feed failed."""
+    failed = [f for f in CONTEXT_FEEDS if f in context.errors]
+    if not failed:
+        _CONTEXT_RETRY.pop(code, None)
+        return
+    generation, last_bump = _CONTEXT_RETRY.get(code, (0, 0.0))
+    now = time.monotonic()
+    if now - last_bump >= DYNAMIC_TTL:
+        _CONTEXT_RETRY[code] = (generation + 1, now)
+        logger.warning(
+            "context feeds %s failed for %s; scheduling re-fetch next cycle",
+            failed, code,
+        )
 
 
 @dataclass(frozen=True)
@@ -113,6 +154,21 @@ def _paths(region_code: str) -> tuple[Path, Path]:
     )
 
 
+def _history_path(region_code: str) -> Path:
+    return CACHE_DIR / f"history_{_safe_code(region_code)}.jsonl"
+
+
+#: How long a region's score history is kept. The dashboard is a live index,
+#: not an archive — this is enough to show a multi-day trend without letting an
+#: unattended run grow the cache without bound.
+HISTORY_RETENTION_DAYS = int(os.getenv("MEHI_HISTORY_DAYS", "90"))
+
+#: Minimum spacing between recorded history points. The page re-renders every
+#: few minutes; recording every render would bury a day's trend in hundreds of
+#: near-identical rows.
+HISTORY_MIN_INTERVAL_SECONDS = 1800.0
+
+
 #: Cap on the number of distinct locations mirrored to disk. Searched locations
 #: are user-driven and otherwise unbounded, so the oldest are evicted once this
 #: many exist. Comfortably above the seven curated regions.
@@ -141,8 +197,12 @@ def _evict_old(keep: int = MAX_CACHED_LOCATIONS) -> None:
                 stale.name.replace("_snapshot.json", "_assessment.json")
             )
             assess.unlink(missing_ok=True)
+            # The score history is keyed by the same safe code; evict it with
+            # its location so searched locations cannot grow the cache forever.
+            safe = stale.name[len("last_good_"):-len("_snapshot.json")]
+            (CACHE_DIR / f"history_{safe}.jsonl").unlink(missing_ok=True)
     except Exception:
-        pass
+        logger.warning("cache eviction failed", exc_info=True)
 
 
 def _persist(region_code: str, snapshot: RegionSnapshot,
@@ -160,7 +220,80 @@ def _persist(region_code: str, snapshot: RegionSnapshot,
         _atomic_write(assess_path, assessment.model_dump_json())
         _evict_old()
     except Exception:
-        pass
+        logger.warning("failed to mirror %s to disk", region_code, exc_info=True)
+
+
+def load_history(region_code: str) -> list[dict[str, Any]]:
+    """Score history for a region, oldest first. Never raises.
+
+    Entries are ``{"at": iso8601, "score": float, "band": str,
+    "confidence": float}``. Returns an empty list when nothing has been
+    recorded yet (a fresh install, or a region only just searched).
+    """
+    path = _history_path(region_code)
+    entries: list[dict[str, Any]] = []
+    try:
+        if not path.exists():
+            return []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue  # skip a torn line rather than losing the file
+            if isinstance(entry, dict) and entry.get("score") is not None:
+                entries.append(entry)
+    except Exception:
+        logger.warning("failed to read history for %s", region_code, exc_info=True)
+        return entries
+    return entries
+
+
+def _append_history(region_code: str, assessment: StressAssessment) -> None:
+    """Append one scored observation, rate-limited and pruned. Best-effort.
+
+    Appending (rather than overwriting, as the last-known-good mirror does) is
+    what makes a multi-day stress trend possible at all.
+    """
+    if assessment.score is None:
+        return
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _history_path(region_code)
+        now = datetime.now(timezone.utc)
+
+        existing = load_history(region_code)
+        if existing:
+            try:
+                last = datetime.fromisoformat(existing[-1]["at"])
+                if (now - last).total_seconds() < HISTORY_MIN_INTERVAL_SECONDS:
+                    return
+            except (KeyError, TypeError, ValueError):
+                pass  # unparseable tail: fall through and append
+
+        entry = {
+            "at": now.isoformat(),
+            "score": assessment.score,
+            "band": assessment.band,
+            "confidence": assessment.confidence,
+        }
+        cutoff = now - timedelta(days=HISTORY_RETENTION_DAYS)
+        kept: list[dict[str, Any]] = []
+        for row in existing:
+            try:
+                if datetime.fromisoformat(row["at"]) >= cutoff:
+                    kept.append(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+        kept.append(entry)
+
+        # Rewritten atomically: the file is small (a few hundred lines at most)
+        # and this is what prunes it.
+        _atomic_write(path, "\n".join(json.dumps(r) for r in kept) + "\n")
+    except Exception:
+        logger.warning("failed to append history for %s", region_code, exc_info=True)
 
 
 def _restore(region_code: str) -> tuple[RegionSnapshot, StressAssessment] | None:
@@ -176,6 +309,7 @@ def _restore(region_code: str) -> tuple[RegionSnapshot, StressAssessment] | None
         )
         return snapshot, assessment
     except Exception:
+        logger.warning("failed to restore %s from disk", region_code, exc_info=True)
         return None
 
 
@@ -190,12 +324,21 @@ def _fetch_dynamic(_region: Region, cache_key: tuple[str, int]) -> FeedBundle:
     return asyncio.run(fetch_feeds(_region, DYNAMIC_FEEDS))
 
 
-@st.cache_data(ttl=CONTEXT_TTL, show_spinner=False, max_entries=64)
-def _fetch_context(_region: Region, cache_key: tuple[str, str]) -> FeedBundle:
+@st.cache_data(ttl=CONTEXT_TTL, show_spinner=False, max_entries=64, persist="disk")
+def _fetch_context(_region: Region, cache_key: tuple[str, str, int]) -> FeedBundle:
     """Slowly-changing feeds (OISST baseline + OBIS + infrastructure).
-    ``cache_key`` is ``(code, UTC-date)`` — the date changes daily and drives
-    invalidation; the long TTL is a memory-bound backstop. Deliberately not
-    keyed by nonce: REFRESH refreshes live conditions, not the stable baseline.
+    ``cache_key`` is ``(code, UTC-date, retry-generation)`` — the date changes
+    daily and drives invalidation; the generation bumps when a cached bundle
+    carries feed errors (see ``_schedule_context_retry``); the long TTL is a
+    memory-bound backstop. Deliberately not keyed by nonce: REFRESH refreshes
+    live conditions, not the stable baseline.
+
+    ``persist="disk"`` is what makes a restart cheap. This tier is the slow one
+    (Overpass + OISST, several seconds cold) but is stable within a UTC day, so
+    Streamlit's on-disk cache lets the *same day's* result survive a process
+    restart instead of re-fetching it — the date in the key still forces a fresh
+    pull the next day, and the retry generation still forces one after a failure.
+    The dynamic tier is deliberately NOT persisted: it is meant to be fresh.
     """
     return asyncio.run(fetch_feeds(_region, CONTEXT_FEEDS))
 
@@ -217,31 +360,37 @@ def _compose(
     telemetry = sorted(
         [*context.telemetry, *dynamic.telemetry], key=lambda e: e.started_at
     )
-    snapshot = RegionSnapshot(
-        region=region,
-        fetched_at=dynamic.fetched_at,
-        duration_ms=duration,
-        obis=context.obis,
-        sea_state=dynamic.sea_state,
-        buoy=dynamic.buoy,
-        climatology=context.climatology,
-        infrastructure=context.infrastructure,
+    # Each tier supplies exactly the feeds it owns, so a feed added to
+    # DYNAMIC_FEEDS / CONTEXT_FEEDS flows through without touching this merge.
+    feed_values = {name: getattr(dynamic, name) for name in DYNAMIC_FEEDS}
+    feed_values.update({name: getattr(context, name) for name in CONTEXT_FEEDS})
+    merged = FeedBundle(
+        feeds_requested=[*context.feeds_requested, *dynamic.feeds_requested],
         errors={**context.errors, **dynamic.errors},
         telemetry=telemetry,
+        duration_ms=duration,
+        fetched_at=dynamic.fetched_at,
+        **feed_values,
     )
+    snapshot = snapshot_from_bundle(region, merged)
     return snapshot, assess_region(snapshot)
 
 
 def _remember(code: str, snapshot: RegionSnapshot, assessment: StressAssessment) -> None:
     """Store as last-known-good (memory + disk), bounded, and only when the
-    result actually carries data — so an outage never poisons the cache."""
-    if assessment.score is None and snapshot.sources_ok < _MIN_SOURCES_TO_PERSIST:
+    result actually carries data — so an outage never poisons the cache.
+
+    A scoreless snapshot is never remembered: "last known good" exists to keep
+    a populated dashboard on screen during an outage, and a result that could
+    not produce a score would overwrite one that did."""
+    if assessment.score is None or snapshot.sources_ok < _MIN_SOURCES_TO_PERSIST:
         return
     _LAST_GOOD.pop(code, None)  # re-insert at end for true LRU eviction
     _LAST_GOOD[code] = (snapshot, assessment)
     while len(_LAST_GOOD) > MAX_CACHED_LOCATIONS:
         _LAST_GOOD.pop(next(iter(_LAST_GOOD)))
     _persist(code, snapshot, assessment)
+    _append_history(code, assessment)
 
 
 def load_region(region: Region | str, nonce: int = 0) -> LoadResult:
@@ -263,12 +412,16 @@ def load_region(region: Region | str, nonce: int = 0) -> LoadResult:
 
     try:
         dynamic = _fetch_dynamic(resolved, (code, nonce))
-        context = _fetch_context(resolved, (code, day_key))
+        context = _fetch_context(
+            resolved, (code, day_key, _context_generation(code))
+        )
+        _schedule_context_retry(code, context)
         snapshot, assessment = _compose(resolved, dynamic, context)
         _remember(code, snapshot, assessment)
         return LoadResult(snapshot, assessment, "live")
     except Exception as exc:
         reason = f"{type(exc).__name__}: {exc}"
+        logger.warning("live load failed for %s; falling back (%s)", code, reason)
 
     remembered = _LAST_GOOD.get(code)
     if remembered is not None:

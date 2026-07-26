@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import random
 import re
 import time
@@ -53,10 +54,22 @@ __all__ = [
     "FEED_NAMES",
     "fetch_feeds",
     "fetch_region_snapshot",
+    "snapshot_from_bundle",
 ]
 
+#: Nominatim and Overpass etiquette require a real, reachable contact in the
+#: User-Agent for unattended clients. Override via MEHI_CONTACT if deploying
+#: under a different operator.
+CONTACT: Final[str] = os.getenv("MEHI_CONTACT", "letterstofranco@gmail.com")
 USER_AGENT: Final[str] = (
-    "MarineEcosystemHealthIndex/1.0 (+https://github.com/; contact via repository)"
+    f"MarineEcosystemHealthIndex/1.0 (marine telemetry dashboard; {CONTACT})"
+)
+#: Per-request HTTP client timeout in seconds, overridable for slow links.
+DEFAULT_TIMEOUT: Final[float] = float(os.getenv("MEHI_HTTP_TIMEOUT", "120"))
+#: Wall-clock ceiling for one Overpass feed across all attempts and mirrors.
+#: Measured worst case without it was 51.5 s of failures before a success.
+OVERPASS_BUDGET_SECONDS: Final[float] = float(
+    os.getenv("MEHI_OVERPASS_BUDGET", "25")
 )
 RETRY_STATUS: Final[frozenset[int]] = frozenset({408, 425, 429, 500, 502, 503, 504})
 EARTH_RADIUS_KM: Final[float] = 6371.0088
@@ -298,10 +311,15 @@ class _BaseClient:
         sink: TelemetrySink,
         *,
         max_attempts: int = 3,
+        budget_seconds: float | None = None,
     ) -> None:
         self._client = client
         self._sink = sink
         self._max_attempts = max_attempts
+        #: Optional wall-clock ceiling across *all* attempts and mirrors. An
+        #: attempt count alone bounds nothing useful when a single failing
+        #: attempt can itself take 20 s: attempts x mirrors then multiplies.
+        self._budget_seconds = budget_seconds
 
     async def _fetch(
         self,
@@ -312,6 +330,7 @@ class _BaseClient:
         data: dict[str, str] | None = None,
         timeout: float = 45.0,
         mirrors: Sequence[str] = (),
+        deadline: float | None = None,
     ) -> httpx.Response:
         """Issue a request with exponential backoff, then mirror rotation.
 
@@ -321,9 +340,19 @@ class _BaseClient:
         """
         candidates = [url, *mirrors]
         last_error: str = "no attempt made"
+        # An explicit deadline lets a caller bound *several* requests together —
+        # a feed that issues a query plus a fallback must not be able to spend
+        # the budget twice.
+        if deadline is None and self._budget_seconds is not None:
+            deadline = time.perf_counter() + self._budget_seconds
 
         for candidate in candidates:
             for attempt in range(1, self._max_attempts + 1):
+                if deadline is not None and time.perf_counter() >= deadline:
+                    raise ApiError(
+                        f"{label}: gave up after {self._budget_seconds:.0f}s "
+                        f"budget — {last_error}"
+                    )
                 started = datetime.now(timezone.utc)
                 t0 = time.perf_counter()
                 try:
@@ -337,6 +366,22 @@ class _BaseClient:
 
                     if response.status_code in RETRY_STATUS:
                         last_error = f"HTTP {response.status_code}"
+                        # 429 is a per-IP rate limit: it will not clear in the
+                        # second or two a backoff waits, so move to the next
+                        # mirror instead of burning attempts on this host. A
+                        # 503/504 is transient load and is worth retrying here.
+                        if response.status_code == 429:
+                            self._sink.record(
+                                TelemetryEvent(
+                                    source=self.source, label=label, method=method,
+                                    url=candidate, status=response.status_code,
+                                    ok=False, latency_ms=elapsed,
+                                    payload_bytes=len(response.content),
+                                    attempts=attempt, started_at=started,
+                                    error=last_error,
+                                )
+                            )
+                            break
                         final = (
                             attempt == self._max_attempts
                             and candidate == candidates[-1]
@@ -606,6 +651,10 @@ class ClimatologySnapshot(BaseModel):
     #: its own uncertainty. Zero means "no trend distinguishable from noise".
     trend_lower_c_per_decade: float | None = None
     failed_years: list[int] = Field(default_factory=list)
+    #: How many baseline years were *requested* — the denominator for any
+    #: coverage/quality ratio. ``years_covered / years_requested`` is meaningful
+    #: for a 3-year smoke test and a 10-year production run alike.
+    years_requested: int = 10
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -790,11 +839,14 @@ class ErddapClient(_BaseClient):
             wtmps: list[float | None] = []
             for row in rows:
                 try:
-                    times.append(
-                        datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
-                    )
+                    parsed = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
                 except (ValueError, IndexError):
                     continue
+                # ERDDAP times are UTC; an offset-less string must not produce a
+                # naive datetime or the age subtraction below raises TypeError.
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                times.append(parsed)
                 wtmps.append(float(row[4]) if row[4] is not None else None)
 
             latest = rows[-1]
@@ -985,6 +1037,7 @@ class ErddapClient(_BaseClient):
             trend_r2=trend_r2,
             trend_lower_c_per_decade=trend_lower,
             failed_years=failed,
+            years_requested=years,
         )
 
 
@@ -1053,44 +1106,36 @@ class OverpassClient(_BaseClient):
     )
 
     async def fetch(self, region: Region, *, sample_cap: int = 800) -> InfrastructureSnapshot:
-        """Fetch authoritative element counts plus a capped tag sample.
+        """Fetch seamark composition, and counts, in **one** query where possible.
 
-        Two queries are used because Overpass reports exact totals only via
-        ``out count``, while composition requires tags. The tag query is capped
-        and its failure is non-fatal — counts alone still drive the density term.
+        Overpass is by far the slowest feed (multi-second at best, tens of
+        seconds when a mirror sheds load), so the number of round trips matters
+        more than anything else here. ``out tags N`` returns one element per
+        feature carrying its ``type``, so node/way totals can be counted from
+        the response instead of asked for separately — the previous ``out
+        count`` query used an identical selector and therefore counted exactly
+        the elements this one returns.
+
+        The separate count query is issued only when the response hits
+        ``sample_cap``, which is the one case where the returned elements are a
+        truncated sample and cannot supply the true total. Relations are never
+        requested by the selector, so ``relation_count`` is structurally zero.
         """
         bbox = f"{region.south},{region.west},{region.north},{region.east}"
-        count_query = (
-            "[out:json][timeout:90];"
+        selector = (
             f'(node["seamark:type"]({bbox});way["seamark:type"]({bbox}););'
-            "out count;"
         )
-        response = await self._fetch(
-            self.MIRRORS[0],
-            "seamark/count",
-            method="POST",
-            data={"data": count_query},
-            timeout=120.0,
-            mirrors=self.MIRRORS[1:],
-        )
-        elements: list[dict[str, Any]] = response.json().get("elements") or []
-        tags: dict[str, str] = next(
-            (e.get("tags", {}) for e in elements if e.get("type") == "count"), {}
-        )
-        snapshot = InfrastructureSnapshot(
-            node_count=int(tags.get("nodes", 0)),
-            way_count=int(tags.get("ways", 0)),
-            relation_count=int(tags.get("relations", 0)),
-            total_count=int(tags.get("total", 0)),
-            area_km2=region.area_km2,
-            mirror_used=str(response.request.url),
-        )
+        tag_query = f"[out:json][timeout:90];{selector}out tags {sample_cap};"
 
-        tag_query = (
-            "[out:json][timeout:90];"
-            f'(node["seamark:type"]({bbox});way["seamark:type"]({bbox}););'
-            f"out tags {sample_cap};"
+        # One deadline for the whole feed, shared by the tag query and any
+        # follow-up count query — otherwise a failed tag query can burn the
+        # budget and the fallback can then burn it all over again.
+        deadline = (
+            time.perf_counter() + self._budget_seconds
+            if self._budget_seconds is not None
+            else None
         )
+        snapshot = InfrastructureSnapshot(area_km2=region.area_km2)
         try:
             tag_response = await self._fetch(
                 self.MIRRORS[0],
@@ -1099,26 +1144,84 @@ class OverpassClient(_BaseClient):
                 data={"data": tag_query},
                 timeout=120.0,
                 mirrors=self.MIRRORS[1:],
+                deadline=deadline,
             )
-            sampled = tag_response.json().get("elements") or []
+            sampled: list[dict[str, Any]] = tag_response.json().get("elements") or []
+            snapshot.mirror_used = str(tag_response.request.url)
         except (ApiError, ValueError):
-            return snapshot
+            # Composition is lost; fall back to the cheap count so the density
+            # term still has a total to work with (density-only scoring).
+            return await self._fetch_counts_only(selector, snapshot, deadline)
 
         breakdown: dict[str, int] = {}
         traffic = 0
+        nodes = ways = 0
         for element in sampled:
             kind = (element.get("tags") or {}).get("seamark:type")
+            element_type = element.get("type")
+            if element_type == "node":
+                nodes += 1
+            elif element_type == "way":
+                ways += 1
             if not kind:
                 continue
             breakdown[kind] = breakdown.get(kind, 0) + 1
             if kind in TRAFFIC_PRESSURE_TYPES:
                 traffic += 1
 
+        snapshot.node_count = nodes
+        snapshot.way_count = ways
+        snapshot.total_count = nodes + ways
         snapshot.type_breakdown = dict(
             sorted(breakdown.items(), key=lambda kv: kv[1], reverse=True)
         )
         snapshot.traffic_features = traffic
         snapshot.sampled_elements = sum(breakdown.values())
+
+        if len(sampled) >= sample_cap:
+            # Truncated: the elements are a sample, so the real total needs the
+            # count query after all. Composition stays as the capped sample.
+            counted = await self._fetch_counts_only(
+                selector, InfrastructureSnapshot(area_km2=region.area_km2),
+                deadline,
+            )
+            if counted.total_count:
+                snapshot.node_count = counted.node_count
+                snapshot.way_count = counted.way_count
+                snapshot.relation_count = counted.relation_count
+                snapshot.total_count = counted.total_count
+        return snapshot
+
+    async def _fetch_counts_only(
+        self,
+        selector: str,
+        snapshot: InfrastructureSnapshot,
+        deadline: float | None = None,
+    ) -> InfrastructureSnapshot:
+        """Populate element counts via ``out count``. Failure is non-fatal."""
+        query = f"[out:json][timeout:90];{selector}out count;"
+        try:
+            response = await self._fetch(
+                self.MIRRORS[0],
+                "seamark/count",
+                method="POST",
+                data={"data": query},
+                timeout=120.0,
+                mirrors=self.MIRRORS[1:],
+                deadline=deadline,
+            )
+            elements: list[dict[str, Any]] = response.json().get("elements") or []
+        except (ApiError, ValueError):
+            return snapshot
+
+        tags: dict[str, str] = next(
+            (e.get("tags", {}) for e in elements if e.get("type") == "count"), {}
+        )
+        snapshot.node_count = int(tags.get("nodes", 0))
+        snapshot.way_count = int(tags.get("ways", 0))
+        snapshot.relation_count = int(tags.get("relations", 0))
+        snapshot.total_count = int(tags.get("total", 0))
+        snapshot.mirror_used = snapshot.mirror_used or str(response.request.url)
         return snapshot
 
 
@@ -1217,7 +1320,7 @@ async def fetch_feeds(
     *,
     baseline_years: int = 10,
     window_days: int = 10,
-    timeout: float = 120.0,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> FeedBundle:
     """Fetch the named feeds concurrently under one client, isolating failures.
 
@@ -1244,7 +1347,12 @@ async def fetch_feeds(
         # The public Overpass instances shed load with 504s under contention.
         # Rotating to the next mirror beats hammering a host that is already
         # saying it is busy, so this client retries less and fails over sooner.
-        overpass = OverpassClient(client, sink, max_attempts=2)
+        # It is also the slowest feed by a wide margin, and a single failing
+        # attempt can take 20 s — so it carries a wall-clock budget as well,
+        # bounding the worst case instead of letting attempts x mirrors compound.
+        overpass = OverpassClient(
+            client, sink, max_attempts=2, budget_seconds=OVERPASS_BUDGET_SECONDS
+        )
 
         # Factories (not coroutines) so unrequested feeds are never created.
         factories = {
@@ -1279,24 +1387,13 @@ async def fetch_feeds(
     )
 
 
-async def fetch_region_snapshot(
-    region: Region,
-    *,
-    baseline_years: int = 10,
-    window_days: int = 10,
-    timeout: float = 120.0,
-) -> RegionSnapshot:
-    """Fetch all five source feeds for a region concurrently and compose them.
+def snapshot_from_bundle(region: Region, bundle: FeedBundle) -> RegionSnapshot:
+    """The single place a :class:`FeedBundle` becomes a :class:`RegionSnapshot`.
 
-    Thin wrapper over :func:`fetch_feeds` requesting every feed at once. The
-    dashboard's caching layer fetches feeds in volatility tiers instead (see
-    ``data_access``); this single-shot form is what the standalone CLIs and
-    tests use, and its behaviour is unchanged.
+    Both the single-shot fetch below and ``data_access``'s two-tier composition
+    go through here, so a new feed field cannot silently exist in one path and
+    not the other.
     """
-    bundle = await fetch_feeds(
-        region, FEED_NAMES,
-        baseline_years=baseline_years, window_days=window_days, timeout=timeout,
-    )
     return RegionSnapshot(
         region=region,
         fetched_at=bundle.fetched_at,
@@ -1309,6 +1406,27 @@ async def fetch_region_snapshot(
         errors=bundle.errors,
         telemetry=bundle.telemetry,
     )
+
+
+async def fetch_region_snapshot(
+    region: Region,
+    *,
+    baseline_years: int = 10,
+    window_days: int = 10,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> RegionSnapshot:
+    """Fetch all five source feeds for a region concurrently and compose them.
+
+    Thin wrapper over :func:`fetch_feeds` requesting every feed at once. The
+    dashboard's caching layer fetches feeds in volatility tiers instead (see
+    ``data_access``); this single-shot form is what the standalone CLIs and
+    tests use, and its behaviour is unchanged.
+    """
+    bundle = await fetch_feeds(
+        region, FEED_NAMES,
+        baseline_years=baseline_years, window_days=window_days, timeout=timeout,
+    )
+    return snapshot_from_bundle(region, bundle)
 
 
 # --------------------------------------------------------------------------- #

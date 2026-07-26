@@ -15,7 +15,7 @@ import pandas as pd
 import streamlit as st
 
 from lab_render import (
-    render_anomalies, render_footer, render_inventory,
+    render_anomalies, render_export, render_footer, render_inventory,
     render_parameter, render_structure, render_summary,
 )
 from ml_analysis import analyze_dataset, profile_dataset, read_uploaded
@@ -51,6 +51,7 @@ if focus:
 render_structure(report)
 render_anomalies(report)
 render_inventory(profile)
+render_export(profile, report)
 render_footer(profile, report)
 
 st.markdown("HARNESS-COMPLETE")

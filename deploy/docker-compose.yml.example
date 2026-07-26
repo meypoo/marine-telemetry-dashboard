@@ -1,0 +1,41 @@
+# App + nginx, with only 443 exposed to the host. Streamlit is reachable to
+# nginx over the internal compose network but is never published to the host,
+# so it cannot be hit without going through TLS + auth.
+#
+# Before `docker compose up -d`:
+#   - build the app image:   docker build -t mehi ..
+#   - create the auth file:  htpasswd -c ./htpasswd yourname
+#   - drop your TLS cert + key in ./certs (fullchain.pem, privkey.pem), or mount
+#     a certbot volume, and set server_name in nginx.conf
+#   - copy nginx.conf.example to ./nginx.conf and adjust cert paths to /etc/...
+
+services:
+  app:
+    image: mehi
+    restart: unless-stopped
+    environment:
+      # Set a real contact — Nominatim/Overpass ask for one and may throttle
+      # a placeholder. See README "Environment overrides" for the full list.
+      MEHI_CONTACT: "you@example.com"
+    volumes:
+      # Persist last-known-good, score history and the context disk cache.
+      - mehi-cache:/app/.cache
+    expose:
+      - "8501"           # internal only — NOT published to the host
+    # No `ports:` here on purpose.
+
+  proxy:
+    image: nginx:stable
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./htpasswd:/etc/nginx/.htpasswd:ro
+      - ./certs:/etc/letsencrypt/live/dashboard.example.com:ro
+
+volumes:
+  mehi-cache:

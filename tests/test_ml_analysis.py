@@ -149,6 +149,39 @@ def test_oversized_upload_rejected_before_parse() -> None:
         ml_analysis.MAX_UPLOAD_BYTES = original
 
 
+def test_anomaly_flag_mask_is_aligned_with_scores() -> None:
+    """``scores`` is in matrix order but ``flagged_indices`` is in frame order,
+    so pairing them by position is wrong the moment the complete-case filter
+    drops a row. ``flagged_mask`` is the aligned view, and the renderer needs
+    it to colour the right bars."""
+    import pandas as pd
+
+    path = FIXTURES / "fixture_known.csv"
+    frame = read_uploaded(str(path), path.read_bytes())
+    # Force the filter to drop rows: prepend all-NaN leading rows.
+    padding = pd.DataFrame({c: [float("nan")] * 40 for c in frame.columns})
+    padded = pd.concat([padding, frame], ignore_index=True)
+
+    profile = profile_dataset(padded, "padded.csv")
+    report = analyze_dataset(padded, profile,
+                             selected_columns=profile.numeric_columns[:8])
+    anomalies = report.anomalies
+    assert anomalies.available, anomalies.reason
+
+    assert len(anomalies.flagged_mask) == len(anomalies.scores), (
+        "the mask must be parallel to the scores it describes"
+    )
+    assert sum(anomalies.flagged_mask) == anomalies.n_anomalies, (
+        f"mask flags {sum(anomalies.flagged_mask)} rows but n_anomalies is "
+        f"{anomalies.n_anomalies}"
+    )
+    # Prove the two index spaces really do diverge here, so this is a live
+    # trap and not a hypothetical one.
+    assert max(anomalies.flagged_indices) >= len(anomalies.scores), (
+        "fixture no longer exercises the divergence; padding may be ineffective"
+    )
+
+
 ALL = [
     test_known_truth_recovery,
     test_ph_trend_recovered,
@@ -158,6 +191,7 @@ ALL = [
     test_edge_cases_degrade_cleanly,
     test_semicolon_delimiter_sniffed,
     test_oversized_upload_rejected_before_parse,
+    test_anomaly_flag_mask_is_aligned_with_scores,
 ]
 
 

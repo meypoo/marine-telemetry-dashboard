@@ -17,6 +17,7 @@ import streamlit as st
 
 from lab_render import (
     render_anomalies,
+    render_export,
     render_footer,
     render_inventory,
     render_parameter,
@@ -196,4 +197,5 @@ render_parameter(frame, profile, report, focus, times_series)
 render_structure(report)
 render_anomalies(report)
 render_inventory(profile)
+render_export(profile, report)
 render_footer(profile, report)

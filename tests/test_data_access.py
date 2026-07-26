@@ -6,6 +6,7 @@ using a temporary cache directory so the real .cache/ is untouched. No network.
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -131,6 +132,198 @@ def test_remember_skips_empty_result() -> None:
     _with_temp_cache(body)
 
 
+def test_remember_skips_scoreless_result_with_live_feeds() -> None:
+    """A snapshot with feeds present but no scorable component must not
+    overwrite a last-known-good that *did* score."""
+    def body(_: Path) -> None:
+        region = Region.from_point("Scoreless", 5.0, 5.0)
+        code = "Scoreless"
+
+        good_snap = RegionSnapshot(
+            region=region, fetched_at=datetime.now(timezone.utc), duration_ms=1.0,
+            sea_state=SeaStateSnapshot(latitude=5.0, longitude=5.0, current_sst_c=20.0),
+            buoy=BuoySnapshot(status="live", water_temp_c=20.1),
+        )
+        good = StressAssessment(region_code=code, region_name=region.name, score=55.0)
+        data_access._LAST_GOOD.pop(code, None)
+        data_access._remember(code, good_snap, good)
+        assert code in data_access._LAST_GOOD, "a scored result should persist"
+
+        # Two feeds arrive, but nothing the analyzer can score.
+        partial = RegionSnapshot(
+            region=region, fetched_at=datetime.now(timezone.utc), duration_ms=1.0,
+            sea_state=SeaStateSnapshot(latitude=5.0, longitude=5.0),
+            buoy=BuoySnapshot(status="partial"),
+        )
+        assert partial.sources_ok >= 2, "fixture should carry two live feeds"
+        scoreless = StressAssessment(region_code=code, region_name=region.name,
+                                     score=None)
+        data_access._remember(code, partial, scoreless)
+
+        kept = data_access._LAST_GOOD[code][1]
+        assert kept.score == 55.0, (
+            f"scoreless result overwrote last-known-good (score now {kept.score})"
+        )
+
+    _with_temp_cache(body)
+
+
+def test_load_region_falls_back_to_memory_then_disk() -> None:
+    """A failed fetch must serve the last good result and flag it stale."""
+    def body(_: Path) -> None:
+        region = Region.from_point("Fallback", 1.0, 2.0)
+        code = region.code
+
+        snap, assess = _make("Fallback")
+        snap = RegionSnapshot(region=region, fetched_at=datetime.now(timezone.utc),
+                              duration_ms=1.0)
+        assess = StressAssessment(region_code=code, region_name=region.name, score=33.0)
+
+        original = data_access._fetch_dynamic
+
+        def explode(_region, _key):  # noqa: ANN001, ANN202
+            raise RuntimeError("upstream down")
+
+        data_access._fetch_dynamic = explode
+        try:
+            # 1. Memory path.
+            data_access._LAST_GOOD[code] = (snap, assess)
+            result = data_access.load_region(region)
+            assert result.ok and result.stale, "should serve stale data, not blank"
+            assert result.origin == "memory"
+            assert result.assessment.score == 33.0
+            assert "upstream down" in (result.error or ""), (
+                "the failure reason should be reported, not hidden"
+            )
+
+            # 2. Disk path, after the process 'restarts' (memory cleared).
+            data_access._persist(code, snap, assess)
+            data_access._LAST_GOOD.pop(code, None)
+            restored = data_access.load_region(region)
+            assert restored.ok and restored.origin == "disk", (
+                f"expected disk fallback, got {restored.origin}"
+            )
+
+            # 3. Nothing ever cached -> explicit empty result, still no raise.
+            other = Region.from_point("NeverSeen", 40.0, 40.0)
+            data_access._LAST_GOOD.pop(other.code, None)
+            empty = data_access.load_region(other)
+            assert not empty.ok and empty.origin == "none"
+            assert empty.error, "an empty result must still carry the reason"
+        finally:
+            data_access._fetch_dynamic = original
+            data_access._LAST_GOOD.pop(code, None)
+
+    _with_temp_cache(body)
+
+
+def test_context_tier_retries_after_a_failed_feed() -> None:
+    """Regression: a transient context-feed failure used to be cached under the
+    (code, UTC-date) key for the rest of the day. The retry generation must
+    change so the next load re-fetches."""
+    code = "RetryRegion"
+    data_access._CONTEXT_RETRY.pop(code, None)
+
+    healthy = FeedBundle(
+        climatology=ClimatologySnapshot(observations=10, baseline_mean=14.0),
+        obis=ObisSnapshot(records=1, species=1, taxa=1, datasets=1,
+                          species_level_records=1, year_min=2000, year_max=2024),
+        infrastructure=InfrastructureSnapshot(total_count=1, area_km2=100.0),
+    )
+    before = data_access._context_generation(code)
+    data_access._schedule_context_retry(code, healthy)
+    assert data_access._context_generation(code) == before, (
+        "a healthy context bundle must not trigger a re-fetch"
+    )
+
+    degraded = FeedBundle(errors={"climatology": "ApiError: HTTP 504"})
+    data_access._schedule_context_retry(code, degraded)
+    after = data_access._context_generation(code)
+    assert after != before, (
+        "a context bundle carrying feed errors must bump the retry generation "
+        "so it is not cached for the rest of the UTC day"
+    )
+
+    # Bumps are rate-limited: an immediate second failure must not bump again.
+    data_access._schedule_context_retry(code, degraded)
+    assert data_access._context_generation(code) == after, (
+        "repeated failures within one cycle should not re-fetch every load"
+    )
+
+    # Recovery clears the retry state.
+    data_access._schedule_context_retry(code, healthy)
+    assert code not in data_access._CONTEXT_RETRY, (
+        "a recovered context tier should stop forcing re-fetches"
+    )
+
+
+def test_history_appends_rate_limits_and_prunes() -> None:
+    """History must accumulate (unlike the last-known-good mirror, which
+    overwrites), skip near-duplicate points, and drop entries past retention."""
+    def body(_: Path) -> None:
+        region = Region.from_point("History", 36.0, -122.0)
+        code = region.code
+        snap = RegionSnapshot(
+            region=region, fetched_at=datetime.now(timezone.utc), duration_ms=1.0,
+            sea_state=SeaStateSnapshot(latitude=36.0, longitude=-122.0,
+                                       current_sst_c=15.0),
+            buoy=BuoySnapshot(status="live", water_temp_c=15.0),
+        )
+        assess = StressAssessment(region_code=code, region_name=region.name,
+                                  score=61.0, band="ELEVATED", confidence=0.8)
+
+        assert data_access.load_history(code) == [], "should start empty"
+
+        data_access._remember(code, snap, assess)
+        assert len(data_access.load_history(code)) == 1
+
+        # A second remember moments later must not record a near-duplicate.
+        data_access._remember(code, snap, assess)
+        assert len(data_access.load_history(code)) == 1, (
+            "history should be rate-limited, not one row per render"
+        )
+
+        # Seed one in-window and one expired entry, then append.
+        now = datetime.now(timezone.utc)
+        recent = now - timedelta(hours=3)
+        expired = now - timedelta(days=data_access.HISTORY_RETENTION_DAYS + 5)
+        data_access._atomic_write(
+            data_access._history_path(code),
+            json.dumps({"at": expired.isoformat(), "score": 10.0,
+                        "band": "LOW", "confidence": 0.5}) + "\n"
+            + json.dumps({"at": recent.isoformat(), "score": 55.0,
+                          "band": "ELEVATED", "confidence": 0.7}) + "\n",
+        )
+        data_access._remember(code, snap, assess)
+
+        scores = [e["score"] for e in data_access.load_history(code)]
+        assert 10.0 not in scores, "an entry past retention should be pruned"
+        assert scores == [55.0, 61.0], f"unexpected history {scores}"
+
+    _with_temp_cache(body)
+
+
+def test_history_ignores_scoreless_and_torn_lines() -> None:
+    def body(_: Path) -> None:
+        region = Region.from_point("Torn", 1.0, 1.0)
+        code = region.code
+        data_access._atomic_write(
+            data_access._history_path(code),
+            json.dumps({"at": datetime.now(timezone.utc).isoformat(),
+                        "score": 44.0, "band": "MODERATE", "confidence": 0.6}) + "\n"
+            + "{not valid json\n"
+            + json.dumps({"at": datetime.now(timezone.utc).isoformat(),
+                          "score": None}) + "\n",
+        )
+        entries = data_access.load_history(code)
+        assert len(entries) == 1, (
+            f"a torn line or scoreless row should be skipped, got {entries}"
+        )
+        assert entries[0]["score"] == 44.0
+
+    _with_temp_cache(body)
+
+
 ALL = [
     test_persist_restore_roundtrip,
     test_atomic_write_leaves_no_temp_files,
@@ -138,6 +331,11 @@ ALL = [
     test_restore_missing_returns_none,
     test_compose_merges_tiers_and_times,
     test_remember_skips_empty_result,
+    test_remember_skips_scoreless_result_with_live_feeds,
+    test_load_region_falls_back_to_memory_then_disk,
+    test_context_tier_retries_after_a_failed_feed,
+    test_history_appends_rate_limits_and_prunes,
+    test_history_ignores_scoreless_and_torn_lines,
 ]
 
 

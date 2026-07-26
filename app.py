@@ -25,7 +25,18 @@ Query parameters (per the design handoff's dev flags):
 
 from __future__ import annotations
 
+import logging
+
 import streamlit as st
+
+# Backend failures (cache mirror problems, feed outages, fallback decisions)
+# are logged rather than silently swallowed; stderr lands in logs/ under
+# run_overnight.ps1. Guarded so Streamlit's script reruns don't stack handlers.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 st.set_page_config(
     page_title="Marine Ecosystem Health Index",

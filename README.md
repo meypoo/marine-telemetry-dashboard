@@ -70,21 +70,39 @@ fit misreads as −0.72) and runs in CI.
   STALE banner rather than blanking. `run_overnight.ps1` restarts the process if
   it dies. Auto-refresh only ticks while a browser tab is open.
 - **Config flags** (query params): `?density=compact`, `?console=0`,
-  `?width=fluid`, `?refresh=<seconds>`.
-- **Not source, not committed:** `.cache/` (runtime snapshots) and `logs/`.
+  `?width=fluid`, `?refresh=<seconds>`, `?alert=<score>` (alert threshold,
+  default 70).
+- **Environment overrides:** `MEHI_CONTACT` (User-Agent contact for
+  Nominatim/Overpass — set a real one when deploying), `MEHI_HTTP_TIMEOUT`,
+  `MEHI_DYNAMIC_TTL`, `MEHI_CONTEXT_TTL`, `MEHI_HISTORY_DAYS`,
+  `MEHI_OVERPASS_BUDGET`.
+- **Speed.** A warm rerun is ~12 ms and REFRESH ~1.4 s; a *cold* load for a
+  location never seen before is 8-20 s, dominated by Overpass. Searching a new
+  place is slower than picking a curated region because it misses both cache
+  tiers, uses a larger bounding box, and adds geocoding plus buoy discovery.
+- **Not source, not committed:** `.cache/` (runtime snapshots and score
+  history) and `logs/`.
 
 ## Deployment
 
+Full instructions, an nginx reverse-proxy config, and a docker-compose file are
+in [`deploy/`](deploy/README.md). In short:
+
 - **Windows:** `run_overnight.ps1` (supervised, self-restarting).
-- **Linux/container:** a [`Dockerfile`](Dockerfile) is provided; the container
-  runtime's restart policy replaces the supervisor. Mount a volume at
-  `/app/.cache` to persist last-known-good data across restarts. *(The Dockerfile
-  is written against the pinned requirements but was not built in the dev
-  environment — smoke-test before relying on it.)*
-- **Put a reverse proxy in front of it.** Streamlit should not be exposed to the
-  public internet directly; terminate TLS and (if needed) add auth at nginx /
-  Caddy / your platform's ingress. There is no built-in authentication — the
-  dashboard is read-only and public by design.
+- **Linux/container:** a hardened [`Dockerfile`](Dockerfile) (non-root user) is
+  provided; the container runtime's restart policy replaces the supervisor.
+  Mount a volume at `/app/.cache` to persist last-known-good data, score history
+  and the context disk cache across restarts. *(No Docker was present in the dev
+  environment, so the image has not been built here — `docker build` and hit
+  `/_stcore/health` before relying on it.)*
+- **Put a reverse proxy in front of it — this is required, not optional.**
+  Streamlit speaks plain HTTP and has no authentication. `deploy/nginx.conf.example`
+  terminates TLS, adds HTTP Basic auth, and carries the WebSocket-upgrade block
+  Streamlit needs. Run the app bound to `127.0.0.1` (or on an internal Docker
+  network) so it is unreachable except through the proxy.
+- **Single instance.** Caches are in-process plus a disk mirror; do not run
+  multiple replicas expecting shared state. Public-API rate limits are per
+  source IP — fine for a few viewers, not for dozens searching concurrently.
 
 ### Known limitations (by design or scope)
 
