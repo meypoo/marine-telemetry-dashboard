@@ -153,6 +153,12 @@ def _base_css(config: TerminalConfig) -> str:
      Live terminal overrides these to zero in its own sheet. */
   .block-container {{ max-width: 1600px !important; margin: 0 auto;
       padding: 16px 28px 48px 28px !important; }}
+  /* Phone: reclaim the desktop gutters. Applies to every page that uses only
+     this base sheet (the Data Lab); the Live terminal still zeroes the padding
+     in its own, later sheet, which wins at equal importance by source order. */
+  @media (max-width: 640px) {{
+      .block-container {{ padding: 12px 14px 32px 14px !important; }}
+  }}
 
   div[data-testid="stVerticalBlock"] {{ gap: 0.35rem !important; }}
   div[data-testid="stHorizontalBlock"] {{ gap: 0.35rem !important; }}
@@ -276,8 +282,13 @@ def _terminal_css(config: TerminalConfig) -> str:
   .block-container {{ {width_rule} width: 100% !important; margin: 0 auto;
       padding: 0 !important; }}
   div[data-testid="stVerticalBlock"] {{ gap: 0 !important; }}
-  div[data-testid="stHorizontalBlock"] {{ gap: 14px !important; align-items: center;
-      flex-wrap: nowrap; }}
+  div[data-testid="stHorizontalBlock"] {{ gap: 14px !important; align-items: center; }}
+  /* Desktop only: the top-bar columns must never wrap there. Scoped rather than
+     global because below 1000px the phone layout depends on Streamlit's native
+     column wrapping, which a bare nowrap would cancel. */
+  @media (min-width: 1001px) {{
+      div[data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap; }}
+  }}
   /* Keep the terminal usable down to a sensible desktop min before scrolling. */
   section.main > div.block-container {{ min-width: 0; }}
 
@@ -286,6 +297,7 @@ def _terminal_css(config: TerminalConfig) -> str:
 
   /* --- top bar --- */
   .tm-topbar {{ padding: {config.pad_outer}px 32px; border-bottom: 1px solid {LINE}; }}
+  .tm-topleft {{ padding: {config.pad_outer}px 0 16px 32px; }}
   .tm-live {{ width: 6px; height: 6px; background: {MIST}; display: inline-block;
       margin-right: 9px; vertical-align: middle; }}
   .tm-title {{ font-size: 20px; font-weight: 700; letter-spacing: 0.03em; color: {PAPER}; }}
@@ -344,6 +356,14 @@ def _terminal_css(config: TerminalConfig) -> str:
       color: {MIST}; padding-left: 34px; margin-top: 6px; }}
   .tm-xaxis > div {{ white-space: nowrap; }}
   .tm-chartrow {{ display: flex; align-items: stretch; }}
+  /* The sparkline keeps its fixed 300x30 SVG attributes (the fidelity check
+     pins the viewBox) but must shrink with its column: at the 320px sidebar
+     breakpoint the content box is ~272px, so an uncapped 300px sparkline
+     overflows it. preserveAspectRatio="none" makes the squeeze harmless. */
+  .tm-spark {{ max-width: 100%; }}
+  /* Two-up panel row (phylum mix / infrastructure). A class, not an inline
+     style, so the phone breakpoint can stack it. */
+  .tm-duo {{ display: flex; gap: 24px; }}
 
   /* --- bar chart --- */
   .tm-bars {{ position: relative; display: flex; align-items: flex-end; gap: 22px;
@@ -423,6 +443,42 @@ def _terminal_css(config: TerminalConfig) -> str:
      up a little width before that happens. */
   @media (max-width: 1280px) {{
       .tm-side {{ width: 320px; min-width: 320px; }}
+  }}
+
+  /* Below ~1000px a 320px sidebar beside a squeezed main column stops being a
+     usable split; stack them instead. The sidebar is first in the DOM, so the
+     hero score leads the page. Streamlit's own columns resume their native
+     wrapping here (the nowrap above is desktop-scoped) and get a tappable
+     minimum width. */
+  @media (max-width: 1000px) {{
+      .tm-body {{ flex-direction: column; }}
+      .tm-side {{ width: 100%; min-width: 0; border-right: none;
+          border-bottom: 1px solid {LINE}; }}
+      div[data-testid="stColumn"] {{ flex: 1 1 220px; min-width: 160px; }}
+  }}
+
+  /* Phone: one column everywhere. Widths change; the design system does not —
+     same tokens, same sharp corners, no motion. */
+  @media (max-width: 640px) {{
+      .tm-topbar {{ padding: 14px 16px; }}
+      .tm-topleft {{ padding: 14px 0 10px 16px; }}
+      .tm-side {{ padding: 16px; }}
+      .tm-main {{ padding: 16px; }}
+      .tm-footer {{ padding: 14px 16px; }}
+      .tm-duo {{ flex-direction: column; }}
+      .tm-tiles {{ grid-template-columns: repeat(2, 1fr); }}
+      .tm-stats {{ flex-direction: column; gap: 0; }}
+      .tm-statcol + .tm-statcol {{ border-left: none; padding-left: 0;
+          border-top: 1px solid {LINE}; margin-top: 10px; padding-top: 10px; }}
+      /* !important to beat the inline width from _hbars; the label already
+         ellipsizes with a title tooltip, so nothing unrecoverable is lost. */
+      .tm-hlabel {{ width: 96px !important; }}
+      /* The legend wraps under the chip here. At desktop it must NOT wrap —
+         it holds its width so the chip absorbs the shrink. */
+      .tm-panelhead {{ flex-wrap: wrap; }}
+      .tm-legend {{ flex-wrap: wrap; }}
+      /* 22px gaps times ten bars would eat most of a ~350px track. */
+      .tm-bars {{ gap: 8px; }}
   }}
 </style>
 """

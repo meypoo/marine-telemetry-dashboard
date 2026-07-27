@@ -154,7 +154,10 @@ def _detail_rows(pairs: Sequence[tuple[str, str]]) -> str:
 def _sparkline(values: Sequence[float], width: int = 300, height: int = 30) -> str:
     points = [float(v) for v in _downsample([v for v in values if v is not None], 13)]
     if len(points) < 2:
-        return f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}"></svg>'
+        return (
+            f'<svg class="tm-spark" viewBox="0 0 {width} {height}" '
+            f'width="{width}" height="{height}" preserveAspectRatio="none"></svg>'
+        )
     low, high = min(points), max(points)
     span = (high - low) or 1.0
     coords = " ".join(
@@ -163,7 +166,8 @@ def _sparkline(values: Sequence[float], width: int = 300, height: int = 30) -> s
         for i, v in enumerate(points)
     )
     return (
-        f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}" '
+        f'<svg class="tm-spark" viewBox="0 0 {width} {height}" '
+        f'width="{width}" height="{height}" '
         f'preserveAspectRatio="none">'
         f'<polyline points="{coords}" fill="none" stroke="{MIST}" stroke-width="1.5"/>'
         "</svg>"
@@ -318,7 +322,7 @@ def render_topbar_left(config: TerminalConfig, subtitle: str, stamp: str) -> str
     into the neighbouring search column when its own column gets narrower than
     the text."""
     return (
-        f'<div style="padding:{config.pad_outer}px 0 16px 32px">'
+        '<div class="tm-topleft">'
         '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
         '<span class="tm-live"></span>'
         '<span class="tm-title">MARINE ECOSYSTEM HEALTH INDEX</span></div>'
@@ -862,7 +866,7 @@ def _composition_panels(snapshot: RegionSnapshot) -> str:
         )
 
     return (
-        '<div style="display:flex;gap:24px">'
+        '<div class="tm-duo">'
         '<section style="flex:1;min-width:0">'
         # Named as a sample, because that is what it is: the shares below are
         # computed over the top-N taxa checklist, not over the region's full

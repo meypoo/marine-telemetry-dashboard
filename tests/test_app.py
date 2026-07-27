@@ -152,6 +152,13 @@ def _fidelity() -> None:
     # year-window can 503 under live conditions.
     bars = body.count('class="tm-bar"')
     years_covered = result.snapshot.climatology.years_covered if result.snapshot.climatology else 0
+    # hbar rows: top-6 per composition panel, but each panel tracks what its
+    # feed returned — under a live Overpass 429 the infrastructure degrades to
+    # a count-only result with no type breakdown (0 rows), which is correct
+    # behaviour, not a rendering defect. Same philosophy as the OISST bars.
+    obis, infra = result.snapshot.obis, result.snapshot.infrastructure
+    expected_hrows = min(6, len(obis.phylum_records) if obis and obis.phylum_records else 0) \
+        + min(6, len(infra.type_breakdown) if infra and infra.type_breakdown else 0)
     checks = {
         "sidebar 360px": "width: 360px" in css,
         "1920px frame": "width: 1920px !important" in css,
@@ -169,7 +176,9 @@ def _fidelity() -> None:
         # the phylum percentages are not read as the region's full composition
         # (they are computed over the top-N checklist sample).
         "16 stat rows": body.count('class="tm-statrow"') == 16,
-        "12 hbar rows": body.count('class="tm-hrow"') == 12,
+        "hbar rows track feed data (<=12)": (
+            body.count('class="tm-hrow"') == expected_hrows and expected_hrows <= 12
+        ),
         # Expandable detail drawers (native <details>), from live data.
         "detail drawers present": 5 <= body.count("<details") <= 7,
         "drawer mini-tables present": body.count('class="tm-mini"') >= 2,

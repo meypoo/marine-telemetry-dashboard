@@ -26,6 +26,13 @@ from ui import TerminalConfig  # noqa: E402
 
 _CSS = ui._base_css(TerminalConfig()) + ui._terminal_css(TerminalConfig())
 
+#: _CSS with every @media block removed. _rule() counts duplicates against this,
+#: because a breakpoint override is an *intentional* second declaration — the
+#: duplicate guard exists to catch two competing top-level rules, where one is
+#: silently lost. (The regex handles one nesting level, which is all a media
+#: block containing plain rules needs.)
+_FLAT_CSS = re.sub(r"@media[^{]*\{(?:[^{}]*\{[^}]*\})*[^{}]*\}", "", _CSS)
+
 #: Every colour the design system defines. Nothing downstream may hard-code one.
 _TOKENS = {
     ui.INK, ui.PAPER, ui.PAPER_DIM, ui.MIST, ui.LINE, ui.BORDER_STRONG,
@@ -34,9 +41,12 @@ _TOKENS = {
 
 
 def _rule(selector: str) -> str:
-    """Declarations for a selector. Fails loudly if the selector is duplicated —
-    two rules for one selector is how an override silently goes missing."""
-    matches = re.findall(re.escape(selector) + r"\s*\{([^}]*)\}", _CSS)
+    """Declarations for a selector. Fails loudly if the selector is duplicated
+    at the top level — two competing rules for one selector is how an override
+    silently goes missing. @media re-declarations are excluded: a breakpoint
+    override is deliberate and the cascade resolves it by viewport, not by
+    accident of source order."""
+    matches = re.findall(re.escape(selector) + r"\s*\{([^}]*)\}", _FLAT_CSS)
     assert matches, f"no CSS rule found for {selector}"
     assert len(matches) == 1, (
         f"{selector} is defined {len(matches)} times; merge them or one will be "
@@ -130,6 +140,13 @@ def test_sidebar_yields_width_before_forcing_page_scroll() -> None:
         "the fixed 360px sidebar is the only element that can push the whole "
         "page into horizontal scroll; it needs a breakpoint"
     )
+    # The mobile retrofit rides on two further breakpoints: <=1000px stacks the
+    # sidebar above the main column, <=640px applies the phone refinements.
+    # String-level guards, because AppTest cannot measure rendered layout.
+    for breakpoint_ in ("@media (max-width: 1000px)", "@media (max-width: 640px)"):
+        assert breakpoint_ in _CSS, (
+            f"{breakpoint_} missing — the stacked mobile layout is gone"
+        )
 
 
 def test_baseline_bars_are_distinguishable() -> None:
