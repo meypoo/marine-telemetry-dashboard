@@ -345,6 +345,34 @@ def location_subtitle(region: Region, coverage: str) -> str:
     )
 
 
+#: Meteorological seasons by month index, northern hemisphere. The southern
+#: hemisphere is the same sequence offset by six months.
+_SEASONS = ("winter", "winter", "spring", "spring", "spring", "summer",
+            "summer", "summer", "autumn", "autumn", "autumn", "winter")
+
+#: Which half of the year a season sits in, for the framing note. Spring and
+#: autumn are named transitional rather than forced into warm/cool.
+_SEASON_PHASE = {
+    "summer": "warm season", "winter": "cool season",
+    "spring": "transitional", "autumn": "transitional",
+}
+
+
+def season_for(latitude: float, at: datetime) -> tuple[str, str]:
+    """(hemisphere, season) at a latitude and date, meteorological convention.
+
+    Within 10° of the equator the temperate season names describe nothing — the
+    year there divides into wet and dry, not warm and cool — so the season is
+    reported as "tropical" instead of asserting a warm/cool half-year that does
+    not exist at that latitude.
+    """
+    if abs(latitude) < 10.0:
+        return "equatorial", "tropical"
+    if latitude >= 0:
+        return "northern", _SEASONS[at.month - 1]
+    return "southern", _SEASONS[(at.month + 5) % 12]
+
+
 def render_footer() -> str:
     return f'<div class="tm-root"><div class="tm-footer">{esc(SOURCES_LINE)}</div></div>'
 
@@ -437,6 +465,27 @@ def _sidebar(
     thermal_available = bool(thermal and thermal.available)
 
     status = f"{assessment.band} · {'STALE' if stale else 'LIVE'}"
+    # The anomaly is measured against the *same calendar date* in the baseline
+    # decade. That date-matching is what stops the index reporting "it is
+    # winter" as stress — and is exactly why it cannot see damage done in an
+    # earlier warm season: a reef cooked last summer sits at a genuinely normal
+    # temperature in its winter and scores clean. The season is stated on the
+    # face so a cool-season reading is not misread as an all-clear.
+    latitude, _ = snapshot.region.centroid
+    hemisphere, season = season_for(latitude, snapshot.fetched_at)
+    phase = _SEASON_PHASE.get(season)
+    season_line = f"{hemisphere} hemisphere · {season}".upper()
+    if phase:
+        season_line += f" ({phase})".upper()
+    season_block = (
+        f'<div style="font-size:10px;letter-spacing:0.08em;margin-top:8px;'
+        f'color:{SIGNAL if season == "winter" else MIST}">{esc(season_line)}</div>'
+        '<div class="tm-mist" style="font-size:10px;line-height:1.5;margin-top:4px">'
+        "Anomaly is vs the same calendar date in the baseline decade — a "
+        "present-conditions reading, with no memory of heat stress accumulated "
+        "in earlier warm seasons.</div>"
+    )
+
     hero = (
         '<div>'
         + _chip("STRESS SCORE")
@@ -453,6 +502,7 @@ def _sidebar(
         + _chip(status, large=True)
         + f'<div class="tm-mist" style="font-size:10.5px;margin-top:6px">'
         f"confidence {assessment.confidence:.0%}</div>"
+        + season_block
         + f'<div style="margin-top:12px">{_sparkline(spark_values)}</div>'
         "</div>"
     )

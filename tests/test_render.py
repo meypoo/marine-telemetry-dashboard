@@ -24,6 +24,7 @@ from api_clients import (  # noqa: E402
 )
 from terminal_render import (  # noqa: E402
     _history_panel, _sst_panel, render_alert_banner, render_comparison,
+    season_for,
 )
 
 _REGION = Region.from_point("Test Bay", 36.8, -121.9)
@@ -376,6 +377,35 @@ def test_new_panels_hardcode_no_hex_outside_the_token_table() -> None:
     assert not stray, f"hard-coded hex outside the token table: {sorted(stray)}"
 
 
+def test_southern_hemisphere_seasons_are_inverted() -> None:
+    """The framing note exists because a reef bleached in one warm season reads
+    normal in the cool season that follows — which for the Great Barrier Reef
+    means July, not January. Getting the hemisphere backwards would label the
+    exact blind spot this note warns about as the warm season."""
+    july = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    january = datetime(2026, 1, 15, tzinfo=timezone.utc)
+
+    assert season_for(-18.3, july) == ("southern", "winter"), (
+        "the Great Barrier Reef is in its cool season in July"
+    )
+    assert season_for(-18.3, january) == ("southern", "summer")
+    assert season_for(36.6, july) == ("northern", "summer")
+    assert season_for(36.6, january) == ("northern", "winter")
+    # Shoulder seasons are named, not rounded into warm or cool.
+    assert season_for(-18.3, datetime(2026, 4, 15, tzinfo=timezone.utc))[1] == "autumn"
+
+
+def test_equatorial_latitudes_report_no_temperate_season() -> None:
+    """Near the equator the year divides into wet and dry, not warm and cool.
+    Asserting "winter" there would be a claim the latitude does not support."""
+    for month in (1, 4, 7, 10):
+        at = datetime(2026, month, 15, tzinfo=timezone.utc)
+        hemisphere, season = season_for(1.5, at)
+        assert (hemisphere, season) == ("equatorial", "tropical"), (
+            f"month {month} produced a temperate season at 1.5°N"
+        )
+
+
 ALL = [
     test_history_panel_empty_state_explains_itself,
     test_history_panel_charts_a_real_series,
@@ -400,6 +430,8 @@ ALL = [
     test_location_subtitle_isolates_the_region_name,
     test_comparison_isolates_region_names,
     test_new_panels_hardcode_no_hex_outside_the_token_table,
+    test_southern_hemisphere_seasons_are_inverted,
+    test_equatorial_latitudes_report_no_temperate_season,
 ]
 
 

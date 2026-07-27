@@ -142,6 +142,17 @@ band of `LOW` reads equally well as "low health", and a 0.0 produced by two excl
 otherwise be indistinguishable from a pristine reading. For the same reason confidence sits next to the hero,
 and each excluded component prints its reason inline rather than only inside the methodology drawer.
 
+**The index has no memory, and says so.** The thermal anomaly is scored against the *same calendar date* in
+the ten-year baseline. That date-matching is what stops the index reporting "it is winter" as stress — and is
+exactly why it cannot see damage done in an earlier warm season: a reef bleached last summer sits at a
+genuinely normal temperature in its winter and scores clean. `terminal_render.season_for` therefore prints the
+hemisphere and season on the face of the sidebar, amber in the cool season, above a one-line statement that the
+score is a present-conditions reading. Do not remove it — without it a cool-season score reads as an all-clear
+for a reef that is in fact wrecked. Near the equator (|lat| < 10°) the function reports `tropical` rather than
+asserting a warm/cool half-year that does not exist at that latitude. A cumulative measure
+(NOAA Coral Reef Watch Degree Heating Weeks) is the real fix and is not implemented; until it is, the
+framing note is the only thing standing between a cool-season reading and a wrong conclusion.
+
 ## Design system
 
 Implemented from the Marine Ecosystem Health Dashboard handoff; tokens live in `ui.py` and nothing downstream
