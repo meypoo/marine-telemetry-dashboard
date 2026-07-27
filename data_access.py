@@ -370,8 +370,15 @@ MAX_CACHED_LOCATIONS = 100
 
 def _atomic_write(path: Path, text: str) -> None:
     """Write via a temp file + os.replace so a concurrent reader never sees a
-    half-written file. os.replace is atomic on the same filesystem."""
-    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
+    half-written file. os.replace is atomic on the same filesystem.
+
+    The temp name carries the thread id as well as the pid: Streamlit serves
+    sessions on threads of one process, so a pid-only name lets two sessions
+    persisting the same region collide — the first os.replace consumes the
+    file and the second raises FileNotFoundError."""
+    tmp = path.with_suffix(
+        path.suffix + f".tmp-{os.getpid()}-{threading.get_ident()}"
+    )
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
