@@ -56,14 +56,22 @@ def _infrastructure() -> InfrastructureSnapshot:
     )
 
 
-def _thermal_stress(*, dhw: float = 1.0, mmm: float = 16.0,
-                    observations: int = 84) -> ThermalStressSnapshot:
-    return ThermalStressSnapshot(
-        mmm_c=mmm, mmm_month=9, mmm_source="test fixture",
-        latest_sst_c=mmm + 0.5, latest_day=date(2026, 7, 11),
-        hotspot_c=0.5, dhw_c_weeks=dhw, observations=observations,
-        window_days=84, lag_days=16,
+def _thermal_stress(*, dhw: float | None = 1.0, peaks: dict[int, float] | None = None,
+                    now_year: int = 2026) -> ThermalStressSnapshot:
+    """A CRW snapshot. ``peaks`` is the annual-peak history; omit it to model a
+    location whose history could not be fetched."""
+    snapshot = ThermalStressSnapshot(
+        dhw_c_weeks=dhw, hotspot_c=0.5, latest_sst_c=16.5,
+        latest_day=date(2026, 7, 25), lag_days=2,
     )
+    if peaks:
+        snapshot.annual_peak_dhw = dict(sorted(peaks.items()))
+        snapshot.history_observations = len(peaks) * 36
+        snapshot.as_of_year = now_year
+        snapshot.worst_year = max(peaks, key=lambda y: peaks[y])
+        snapshot.worst_dhw = peaks[snapshot.worst_year]
+        snapshot.years_since_worst = now_year - snapshot.worst_year
+    return snapshot
 
 
 def _snapshot(**feeds) -> RegionSnapshot:
@@ -80,7 +88,7 @@ def _full_snapshot() -> RegionSnapshot:
                           age_hours=1.0),
         sea_state=SeaStateSnapshot(latitude=36.8, longitude=-121.9,
                                    current_sst_c=15.1, sst_c=[15.1]),
-        thermal_stress=_thermal_stress(),
+        thermal_stress=_thermal_stress(peaks={2024: 1.0, 2025: 1.2, 2026: 1.0}),
         obis=_obis(),
         infrastructure=_infrastructure(),
     )
@@ -162,28 +170,28 @@ def test_bleaching_wording_is_gated_on_reef_latitude() -> None:
     assert any("bleaching likely" in n for n in keys.notes), (
         "a reef at DHW 5 must carry NOAA's interpretation"
     )
-    assert not any("bleaching" in n.lower() and "not applied" not in n
+    assert not any("bleaching likely" in n or "bleaching with mortality" in n
                    for n in monterey.notes), (
         "a temperate location must not be told it is bleaching"
     )
-    assert any("not applied" in n for n in monterey.notes), (
-        "and must say why the bands are absent"
+    assert any("outside reef latitudes" in n and "coral" in n
+               for n in monterey.notes), (
+        "and must say the scale it is being read on is coral-derived"
     )
     # Same accumulation scores the same either way — only the wording differs.
     assert keys.score == monterey.score
 
 
-def test_thermal_stress_degrades_without_a_fixed_baseline() -> None:
-    """No MMM means no reference point. The component must report itself
-    unavailable so its weight renormalises away, never score on a guess."""
+def test_thermal_stress_degrades_without_any_dhw_data() -> None:
+    """No current reading and no history means nothing to score. The component
+    must report itself unavailable so its weight renormalises away, rather than
+    scoring 0.0 — which on this scale reads as "pristine"."""
     from analyzer import _score_thermal_stress
     from api_clients import ThermalStressSnapshot
 
     for label, snapshot in [
         ("feed missing", None),
-        ("no MMM", ThermalStressSnapshot(mmm_c=None, dhw_c_weeks=2.0)),
-        ("no window data",
-         ThermalStressSnapshot(mmm_c=28.0, dhw_c_weeks=None, observations=0)),
+        ("empty payload", ThermalStressSnapshot()),
     ]:
         component = _score_thermal_stress(snapshot, 24.8)
         assert not component.available, f"{label} must not be scored"
@@ -191,18 +199,110 @@ def test_thermal_stress_degrades_without_a_fixed_baseline() -> None:
         assert component.unavailable_reason, f"{label} must say why"
 
 
-def test_partial_accumulation_window_lowers_quality_not_score() -> None:
-    """A half-filled window under-accumulates and would read as calm. The
-    shortfall belongs in quality (which feeds confidence), not in the score."""
+def test_past_bleaching_still_counts_in_the_cool_season() -> None:
+    """The whole reason the history exists.
+
+    DHW's window is 12 weeks, so a reef that bleached last summer reads a
+    genuine 0.0 in its winter — which is exactly how the Great Barrier Reef
+    scored LOW while carrying 7.3 °C-weeks from the previous year. The
+    component must score the remembered event, not the empty window.
+    """
     from analyzer import _score_thermal_stress
 
-    full = _score_thermal_stress(_thermal_stress(dhw=3.0, observations=84), 24.8)
-    partial = _score_thermal_stress(_thermal_stress(dhw=3.0, observations=21), 24.8)
-
-    assert full.score == partial.score, "quality must not distort the score"
-    assert partial.quality < full.quality, (
-        "a quarter-filled window must reduce confidence in the reading"
+    winter_after_bleaching = _thermal_stress(
+        dhw=0.0, peaks={2024: 7.3, 2025: 6.5, 2026: 0.0}, now_year=2026
     )
+    component = _score_thermal_stress(winter_after_bleaching, -18.3)
+
+    assert component.available
+    assert component.score > 70.0, (
+        f"a reef with 6.5 °C-weeks last year scored {component.score}; the "
+        "12-week window being empty today must not read as healthy"
+    )
+    assert any("history" in n for n in component.notes), (
+        "the panel must say the score came from history, not the current window"
+    )
+
+    # And with no such history, the same empty window is genuinely calm.
+    calm = _score_thermal_stress(
+        _thermal_stress(dhw=0.0, peaks={2024: 0.1, 2025: 0.0, 2026: 0.0}), -18.3
+    )
+    assert calm.score < 5.0, "a location with no thermal history must score low"
+
+
+def test_older_events_count_less_than_recent_ones() -> None:
+    """The decay is a modelling choice, not a NOAA standard, but it must at
+    least be monotonic: a severe event last year cannot count for less than the
+    same event a decade ago."""
+    from analyzer import _recency_weight, _score_thermal_stress
+
+    weights = [_recency_weight(y) for y in range(0, 12)]
+    assert weights == sorted(weights, reverse=True), (
+        f"recency weight must never increase with age: {weights}"
+    )
+    assert weights[0] == 1.0, "a current event counts in full"
+    assert weights[11] == 0.0, "beyond the recovery window it stops counting"
+
+    recent = _score_thermal_stress(
+        _thermal_stress(dhw=0.0, peaks={2025: 8.0}, now_year=2026), -18.3
+    )
+    ancient = _score_thermal_stress(
+        _thermal_stress(dhw=0.0, peaks={2015: 8.0}, now_year=2026), -18.3
+    )
+    assert recent.score > ancient.score, (
+        "an event last year must outweigh the same event eleven years ago"
+    )
+
+
+def test_an_old_severe_event_cannot_mask_a_recent_one() -> None:
+    """Regression: scoring decayed only the single worst year, so the Great
+    Barrier Reef scored 12.5 — its 2017 peak (8.6 °C-weeks) is nine years gone
+    and worth 12% of itself, which buried 2024's still-current 7.3. Every year
+    must be aged on its own and the strongest survivor wins.
+    """
+    from analyzer import _score_thermal_stress
+
+    gbr = _thermal_stress(
+        dhw=0.0,
+        peaks={2016: 5.5, 2017: 8.6, 2018: 0.3, 2019: 0.0, 2020: 6.5,
+               2021: 0.1, 2022: 6.2, 2023: 1.5, 2024: 7.3, 2025: 6.5,
+               2026: 2.8},
+        now_year=2026,
+    )
+    component = _score_thermal_stress(gbr, -18.3)
+
+    assert component.score > 80.0, (
+        f"the GBR scored {component.score}; 7.3 °C-weeks two years ago must "
+        "not be masked by an older, larger event that has since decayed"
+    )
+    assert component.detail["scoring_year"] in (2024, 2025), (
+        f"scored on {component.detail['scoring_year']}, expected a recent year"
+    )
+    # The raw worst is still reported, just not what drives the score.
+    assert component.detail["worst_year"] == 2017
+
+
+def test_current_reading_wins_when_it_is_worse_than_history() -> None:
+    """A reef cooking right now must not be discounted because its past was
+    calm — the component takes the worse of the two readings."""
+    from analyzer import _score_thermal_stress
+
+    component = _score_thermal_stress(
+        _thermal_stress(dhw=10.0, peaks={2020: 0.5, 2026: 10.0}, now_year=2026), 24.8
+    )
+    assert component.score == 100.0, "10 °C-weeks now is past NOAA severe"
+    assert any("severe" in n.lower() for n in component.notes)
+
+
+def test_missing_history_still_scores_the_current_window() -> None:
+    """History is best-effort: if that request fails the current reading is
+    still worth having, flagged for what it cannot see."""
+    from analyzer import _score_thermal_stress
+
+    component = _score_thermal_stress(_thermal_stress(dhw=6.0, peaks=None), 24.8)
+    assert component.available and component.score > 0
+    assert component.quality < 1.0, "a partial answer must reduce confidence"
+    assert any("no peak history" in n for n in component.notes)
 
 
 def test_dropped_component_renormalises_surviving_weights() -> None:
@@ -393,8 +493,12 @@ ALL = [
     test_all_components_available_uses_nominal_weights,
     test_dhw_is_anchored_on_noaa_calibrated_thresholds,
     test_bleaching_wording_is_gated_on_reef_latitude,
-    test_thermal_stress_degrades_without_a_fixed_baseline,
-    test_partial_accumulation_window_lowers_quality_not_score,
+    test_thermal_stress_degrades_without_any_dhw_data,
+    test_past_bleaching_still_counts_in_the_cool_season,
+    test_older_events_count_less_than_recent_ones,
+    test_an_old_severe_event_cannot_mask_a_recent_one,
+    test_current_reading_wins_when_it_is_worse_than_history,
+    test_missing_history_still_scores_the_current_window,
     test_dropped_component_renormalises_surviving_weights,
     test_blend_is_the_weighted_mean_of_components,
     test_no_components_yields_none_not_zero,

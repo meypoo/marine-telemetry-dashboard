@@ -34,9 +34,8 @@ __all__ = [
 ]
 SOURCES_LINE = (
     "SOURCES: NOAA ERDDAP coastwatch.pfeg.noaa.gov (cwwcNDBCMet in-situ buoy, "
-    "ncdcOisst21Agg OISST v2.1 day-of-year baseline, and 1985-2012 fixed "
-    "climatology for Degree Heating Weeks after NOAA Coral Reef Watch) · "
-    "Open-Meteo Marine "
+    "ncdcOisst21Agg OISST v2.1 day-of-year baseline, NOAA_DHW Coral Reef Watch "
+    "5 km Degree Heating Weeks) · Open-Meteo Marine "
     "marine-api.open-meteo.com (model SST) · OBIS api.obis.org/v3 (occurrence "
     "statistics and taxonomic checklist) · OpenSeaMap via Overpass "
     "overpass-api.de (charted seamarks). Stress score is computed from these "
@@ -258,25 +257,36 @@ def _line_chart(
     return "".join(parts), ticks
 
 
-def _bar_chart(years: list[int], values: list[float], threshold: float | None) -> str:
+def _bar_chart(years: list[int], values: list[float], threshold: float | None,
+               *, zero_based: bool = False, empty_label: str = "baseline unavailable",
+               unit: str = "degC", bar_class: str = "tm-bar") -> str:
     """Vertical bars in a 130px track with an overlaid amber threshold line.
 
     The scale is anchored just below the smallest value rather than at zero:
     yearly SST means differ by tenths of a degree, and on a zero-based scale
     every bar renders at ~90% height and the differences vanish.
+
+    ``zero_based`` inverts that for quantities where zero is a real reading
+    rather than an arbitrary floor — Degree Heating Weeks being the case: a
+    year with no accumulation must render flat, and floating the axis under it
+    would draw a calm year at the same height as a catastrophic one.
     """
     if not values:
-        return f'<div class="tm-mist" style="font-size:11.5px">baseline unavailable</div>'
+        return f'<div class="tm-mist" style="font-size:11.5px">{esc(empty_label)}</div>'
 
     bounds = [*values, *( [threshold] if threshold is not None else [] )]
-    scale_min = min(bounds) - 0.5
+    scale_min = 0.0 if zero_based else min(bounds) - 0.5
     scale_max = max(bounds) + 0.5
     span = scale_max - scale_min
 
+    # ``bar_class`` distinguishes one chart's bars from another's. There are two
+    # year-indexed bar charts on the page now — the OISST baseline and the DHW
+    # history — and the fidelity check counts the baseline's bars by exact class
+    # match, so they must not be indistinguishable in the markup.
     bars = "".join(
-        f'<div class="tm-bar" '
+        f'<div class="{bar_class}" '
         f'style="height:{max(2.0, (v - scale_min) / span * 130):.1f}px" '
-        f'title="{y}: {v:.2f} degC"></div>'
+        f'title="{y}: {v:.2f} {unit}"></div>'
         for y, v in zip(years, values)
     )
     line = ""
@@ -1023,7 +1033,7 @@ def _thermal_stress_panel(snapshot: RegionSnapshot,
     component = assessment.component("thermal_stress")
     chip = _chip("ACCUMULATED HEAT STRESS — DEGREE HEATING WEEKS", block=True)
 
-    if stress is None or stress.dhw_c_weeks is None or stress.mmm_c is None:
+    if stress is None or (stress.dhw_c_weeks is None and not stress.annual_peak_dhw):
         reason = (
             component.unavailable_reason
             if component is not None and component.unavailable_reason
@@ -1035,7 +1045,7 @@ def _thermal_stress_panel(snapshot: RegionSnapshot,
             f"{esc(reason)}</div></section>"
         )
 
-    dhw = stress.dhw_c_weeks
+    dhw = stress.dhw_c_weeks if stress.dhw_c_weeks is not None else 0.0
     latitude = snapshot.region.centroid[0]
     reef = is_reef_latitude(latitude)
     fill_pct = min(100.0, dhw / _DHW_GAUGE_MAX * 100.0)
@@ -1076,33 +1086,62 @@ def _thermal_stress_panel(snapshot: RegionSnapshot,
     else:
         verdict = "below NOAA's bleaching threshold in the current window"
 
+    # The history is the reason this panel exists at all: the gauge above shows
+    # a 12-week window that a cool-season reef empties out, and on its own it
+    # calls a reef wrecked last summer healthy.
+    history = ""
+    if stress.annual_peak_dhw:
+        years = list(stress.annual_peak_dhw)
+        peaks = [stress.annual_peak_dhw[y] for y in years]
+        history = (
+            '<div style="margin-top:18px">'
+            + _chip("PEAK DHW BY YEAR — THE MEMORY THE 12-WEEK WINDOW LOSES",
+                    block=True)
+            + '<div style="margin-top:10px">'
+            + _bar_chart(years, peaks, DHW_BLEACHING_LIKELY, zero_based=True,
+                         unit="degC-weeks", bar_class="tm-bar tm-dhwbar",
+                         empty_label="no peak history for this location")
+            + "</div></div>"
+        )
+
     rows = [
-        _row("Degree heating weeks", f"{dhw:.2f} °C-weeks",
+        _row("Degree heating weeks (now)", f"{dhw:.2f} °C-weeks",
              colour=accent, small_key=True, medium_value=True),
-        _row("Warmest-month mean (MMM)",
-             f"{stress.mmm_c:.2f} °C"
-             + (f" · month {stress.mmm_month}" if stress.mmm_month else ""),
+        _row("Worst in last "
+             f"{stress.history_years} y",
+             (f"{stress.worst_dhw:.2f} °C-weeks · {stress.worst_year}"
+              if stress.worst_dhw is not None else "--"),
+             colour=(
+                 SIGNAL
+                 if reef and (stress.worst_dhw or 0) >= DHW_BLEACHING_LIKELY
+                 else PAPER
+             ),
              small_key=True, medium_value=True),
         _row("Latest SST", fmt(stress.latest_sst_c, ".2f", " °C"),
              small_key=True, medium_value=True),
-        _row("HotSpot vs MMM",
+        _row("HotSpot vs warmest-month mean",
              fmt(stress.hotspot_c, "+.2f", " °C")
              + (" ▲" if (stress.hotspot_c or 0) >= 1.0 else ""),
              colour=SIGNAL if (stress.hotspot_c or 0) >= 1.0 else PAPER,
              small_key=True, medium_value=True),
         _row("Accumulation window",
-             f"{stress.window_days // 7} weeks · {stress.observations} daily obs",
+             f"{stress.window_days // 7} weeks rolling · CRW 5 km",
              small_key=True, medium_value=True),
     ]
 
     detail_pairs = [
-        ("MMM source", stress.mmm_source or "--"),
-        ("MMM (°C)", f"{stress.mmm_c:.2f}"),
-        ("warmest month", str(stress.mmm_month or "--")),
+        ("source", "NOAA Coral Reef Watch 5 km daily (NOAA_DHW)"),
+        ("current DHW (°C-weeks)",
+         f"{stress.dhw_c_weeks:.2f}" if stress.dhw_c_weeks is not None else "--"),
+        ("worst year", str(stress.worst_year or "--")),
+        ("worst DHW (°C-weeks)",
+         f"{stress.worst_dhw:.2f}" if stress.worst_dhw is not None else "--"),
+        ("years since worst",
+         str(stress.years_since_worst if stress.years_since_worst is not None else "--")),
         ("latest observation", str(stress.latest_day or "--")),
         ("observation lag (days)", str(stress.lag_days if stress.lag_days is not None else "--")),
-        ("daily observations", str(stress.observations)),
-        ("window (days)", str(stress.window_days)),
+        ("history years requested", str(stress.history_years)),
+        ("history samples", str(stress.history_observations)),
         ("grid cell", f"{stress.latitude}, {stress.longitude}"),
         ("reef latitude", "yes" if reef else "no"),
     ]
@@ -1119,6 +1158,7 @@ def _thermal_stress_panel(snapshot: RegionSnapshot,
         '<section>' + chip + gauge + "".join(rows)
         + f'<div class="tm-mist" style="font-size:10.5px;line-height:1.5;'
         f'margin-top:8px">{esc(verdict)}</div>'
+        + history
         + drawer
         + "</section>"
     )

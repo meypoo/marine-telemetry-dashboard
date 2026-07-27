@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import api_clients  # noqa: E402
 from api_clients import (  # noqa: E402
-    CURATED_MMM, MMM_BASELINE_END, MMM_BASELINE_START, REGIONS_BY_CODE,
+    DHW_HISTORY_STRIDE_DAYS, DHW_HISTORY_YEARS, REGIONS_BY_CODE,
     ApiError, ErddapClient, OverpassClient, TelemetryEvent,
     TelemetrySink, _BaseClient, _haversine_km, _linear_trend,
 )
@@ -376,44 +376,43 @@ def test_sst_url_normalises_longitude_per_dataset() -> None:
     assert "%5B" in wrapped and wrapped.count("?") == 1
 
 
-def test_sst_url_carries_the_subsampling_stride() -> None:
-    """The stride is what makes a 28-year climatology one request instead of
-    ten thousand points. If it silently dropped back to 1, MMM would still be
-    correct but the fetch would blow the cold-load budget."""
-    client = ErddapClient.__new__(ErddapClient)
-    url = client._sst_url(
-        "ncdcOisst21Agg_LonPM180", 24.85, -81.05,
-        date(1985, 1, 1), date(2012, 12, 31), stride=7,
-    )
-    assert "):7:(" in url, f"stride missing from griddap slice: {url}"
-    # Default stays daily for the trailing accumulation window.
-    daily = client._sst_url(
-        "ncdcOisst21Agg_LonPM180", 24.85, -81.05, date(2026, 1, 1), date(2026, 3, 1)
-    )
-    assert "):1:(" in daily, "the DHW window must stay daily by default"
+def test_dhw_url_targets_crw_and_carries_the_stride() -> None:
+    """DHW comes from NOAA Coral Reef Watch's own 5 km product, not from a
+    local reimplementation over OISST. That is deliberate: an OISST-derived
+    version reported 0.0 °C-weeks through four documented Great Barrier Reef
+    mass-bleaching years, because getting the fixed maximum-monthly-mean
+    climatology right is subtle and CRW already does it.
 
-
-def test_mmm_baseline_is_fixed_and_predates_recent_warming() -> None:
-    """Regression guard on the single most dangerous mistake in this feature.
-
-    Computing MMM from a rolling recent window folds the warming DHW exists to
-    detect into the baseline it is measured against. Verified against the Great
-    Barrier Reef: a rolling ten-year MMM (29.21 °C) reported 0.0 °C-weeks for
-    2016, 2017, 2022 and 2024 — all documented mass-bleaching years — where the
-    fixed 1985-2012 baseline (28.70 °C) scores them 2.2, 5.0, 3.4 and 1.4. The
-    component would have looked like it worked and been wrong every time.
+    The stride is what makes a decade of history affordable — DHW is already a
+    12-week rolling accumulation, so its annual peak survives coarse sampling.
     """
-    assert MMM_BASELINE_START.year == 1985 and MMM_BASELINE_END.year == 2012, (
-        "MMM must use NOAA Coral Reef Watch's fixed 1985-2012 climatology"
+    client = ErddapClient.__new__(ErddapClient)
+    url = client._dhw_url(
+        ErddapClient.DHW_DATASET, ("CRW_DHW",), -18.30, 147.00,
+        date(2016, 1, 1), date(2026, 7, 25), stride=DHW_HISTORY_STRIDE_DAYS,
     )
-    assert MMM_BASELINE_END.year < date.today().year - 5, (
-        "the MMM baseline must not creep forward into the warming it measures"
+    assert "/griddap/NOAA_DHW.json" in url, f"not pointed at CRW: {url}"
+    assert "CRW_DHW" in url, "the DHW variable must be requested by name"
+    assert f"):{DHW_HISTORY_STRIDE_DAYS}:(" in url, f"stride missing: {url}"
+    # NOAA_DHW takes signed longitude; its _Lon0360 twin does not.
+    assert "(147.0000)" in url, f"signed longitude must survive: {url}"
+    wrapped = client._dhw_url(
+        ErddapClient.DHW_DATASET_FALLBACK, ("CRW_DHW",), -18.30, -121.90,
+        date(2026, 1, 1), date(2026, 2, 1),
     )
-    # Every curated constant was computed from that fixed window, so none may
-    # sit implausibly far from a real sea-surface temperature.
-    for code, (mmm, month) in CURATED_MMM.items():
-        assert -2.0 < mmm < 35.0, f"{code} MMM {mmm} is not a sea temperature"
-        assert 1 <= month <= 12, f"{code} warmest month {month} is not a month"
+    assert "(238.1000)" in wrapped, f"fallback must map to 0-360: {wrapped}"
+
+
+def test_dhw_history_stride_stays_fine_enough_to_find_annual_peaks() -> None:
+    """Measured on the Great Barrier Reef against a stride-5 reference: stride
+    10 moves no annual peak by more than 0.14 °C-weeks, while stride 20 drifts
+    0.76 and starts flattening real events. Ten days is the ceiling."""
+    assert 1 <= DHW_HISTORY_STRIDE_DAYS <= 10, (
+        "a coarser stride than 10 days loses annual DHW peaks"
+    )
+    assert DHW_HISTORY_YEARS >= 5, (
+        "the history must span enough years to hold a recent bleaching event"
+    )
 
 
 def test_linear_trend_reports_slope_with_uncertainty() -> None:
@@ -456,8 +455,8 @@ ALL = [
     test_overpass_survives_total_failure,
     test_rate_limit_moves_to_the_next_mirror_instead_of_retrying,
     test_wall_clock_budget_bounds_a_slow_failure,
-    test_sst_url_carries_the_subsampling_stride,
-    test_mmm_baseline_is_fixed_and_predates_recent_warming,
+    test_dhw_url_targets_crw_and_carries_the_stride,
+    test_dhw_history_stride_stays_fine_enough_to_find_annual_peaks,
     test_latency_percentile_nearest_rank,
     test_sst_url_normalises_longitude_per_dataset,
     test_linear_trend_reports_slope_with_uncertainty,

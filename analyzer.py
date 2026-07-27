@@ -72,6 +72,14 @@ NOMINAL_WEIGHTS: Final[dict[str, float]] = {
     "pressure": 0.25,
 }
 
+#: How long a past bleaching event keeps counting at full strength, and when it
+#: stops counting at all. **Modelling choices, not NOAA standards** — see
+#: ``_recency_weight``. NOAA calibrates DHW against bleaching as it happens and
+#: publishes nothing about persistence; these bracket published reef recovery
+#: times for a severe event. Same epistemic status as ``PHYLUM_SENSITIVITY``.
+RECENT_EVENT_YEARS: Final[int] = 2
+RECOVERY_YEARS: Final[int] = 10
+
 #: Relative susceptibility of each phylum to warming and acidification, on 0-1.
 #: Calcifiers and sessile taxa score highest (reef-building Cnidaria bleach and
 #: dissolve; Mollusca and Echinodermata face aragonite undersaturation), mobile
@@ -342,17 +350,48 @@ def _score_thermal(
 # --------------------------------------------------------------------------- #
 # Component 2 — accumulated thermal stress (Degree Heating Weeks)
 # --------------------------------------------------------------------------- #
+def _dhw_to_score(dhw: float) -> float:
+    """Map °C-weeks onto 0-100 through NOAA's two calibrated thresholds.
+
+    This is the only component whose number means something outside this
+    dashboard, so the anchors are the published ones: 4 °C-weeks ("significant
+    bleaching likely") lands at 70, the bottom of this dashboard's CRITICAL
+    band, and 8 ("severe with mortality") saturates the scale.
+    """
+    if dhw <= DHW_BLEACHING_LIKELY:
+        return _clamp(dhw / DHW_BLEACHING_LIKELY * 70.0)
+    span = DHW_SEVERE - DHW_BLEACHING_LIKELY
+    return _clamp(70.0 + (dhw - DHW_BLEACHING_LIKELY) / span * 30.0)
+
+
+def _recency_weight(years_since: int) -> float:
+    """How much a past bleaching event still counts, 1.0 down to 0.0.
+
+    **A modelling choice, not a NOAA standard** — the same status as
+    ``PHYLUM_SENSITIVITY``. NOAA calibrates DHW against bleaching *at the time
+    it happens* and publishes nothing about how long that damage should keep
+    counting. Full weight for two years, then straight-line decay to zero at
+    ``RECOVERY_YEARS``, which brackets published reef recovery times for a
+    severe event. Treat the shape as an assumption to argue with, not a result.
+    """
+    if years_since <= RECENT_EVENT_YEARS:
+        return 1.0
+    if years_since >= RECOVERY_YEARS:
+        return 0.0
+    span = RECOVERY_YEARS - RECENT_EVENT_YEARS
+    return _clamp((RECOVERY_YEARS - years_since) / span, 0.0, 1.0)
+
+
 def _score_thermal_stress(
     stress: ThermalStressSnapshot | None, latitude: float
 ) -> ComponentScore:
-    """Score accumulated heat stress, NOAA Coral Reef Watch Degree Heating Weeks.
+    """Score accumulated heat stress from NOAA Coral Reef Watch.
 
-    This is the only component with an *outcome-calibrated* scale: NOAA fixes
-    4 °C-weeks as "significant bleaching likely" and 8 as "severe bleaching
-    with mortality", both validated against observed reef mortality. The score
-    is anchored on exactly those two points — 4 maps to 70, the bottom of this
-    dashboard's CRITICAL band, and 8 maps to 100 — so the number the panel
-    shows and the number the published scale means are the same number.
+    Scores the worse of two readings: what this location is accumulating *now*,
+    and what it has already been through recently, discounted by how long ago.
+    The second term is the point — DHW's own window is 12 weeks, so a reef that
+    bleached last summer reads a genuine 0.0 in its winter, and an index built
+    only on the current window calls that healthy.
 
     The *bands* are coral-specific; the underlying quantity is not. Accumulated
     warm anomaly is real stress in a kelp forest too (the 2014-16 north-east
@@ -366,79 +405,122 @@ def _score_thermal_stress(
     )
     try:
         if stress is None:
-            component.unavailable_reason = "OISST thermal-stress fetch failed"
+            component.unavailable_reason = "Coral Reef Watch fetch failed"
             return component
-        if stress.mmm_c is None:
+
+        current = stress.dhw_c_weeks
+        if current is None and not stress.annual_peak_dhw:
             component.unavailable_reason = (
-                "no fixed-baseline climatology for this location"
+                "no Degree Heating Week data for this location"
             )
             return component
-        if stress.dhw_c_weeks is None or stress.observations == 0:
-            component.unavailable_reason = "no recent SST in the accumulation window"
-            return component
 
-        dhw = stress.dhw_c_weeks
-        if dhw <= DHW_BLEACHING_LIKELY:
-            score = dhw / DHW_BLEACHING_LIKELY * 70.0
-        else:
-            span = DHW_SEVERE - DHW_BLEACHING_LIKELY
-            score = 70.0 + (dhw - DHW_BLEACHING_LIKELY) / span * 30.0
+        current_score = _dhw_to_score(current) if current is not None else 0.0
 
-        component.score = _clamp(score)
+        # Every year is aged on its own, and the strongest surviving signal
+        # wins. Decaying only the single worst year would let an old severe
+        # event mask a recent near-severe one — on the Great Barrier Reef that
+        # is the difference between scoring 2017 (8.6 °C-weeks, nine years
+        # gone, worth 12% of itself) and 2024 (7.3 °C-weeks, still current).
+        history_score = 0.0
+        driving_year: int | None = None
+        as_of = stress.as_of_year
+        if as_of is not None:
+            for year, peak in stress.annual_peak_dhw.items():
+                aged = _dhw_to_score(peak) * _recency_weight(as_of - year)
+                if aged > history_score:
+                    history_score, driving_year = aged, year
+
+        component.score = _clamp(max(current_score, history_score))
         component.available = True
-        # Coverage of the window is the honest quality signal: a partly-filled
-        # window under-accumulates and would read as calm rather than unknown.
+        # Quality reflects what was actually retrievable: the current reading
+        # alone answers a narrower question than current plus history.
         component.quality = _clamp(
-            stress.observations / max(1, stress.window_days), 0.0, 1.0
+            (0.5 if current is not None else 0.0)
+            + (0.5 if stress.annual_peak_dhw else 0.0),
+            0.0, 1.0,
         )
 
-        if is_reef_latitude(latitude):
-            if dhw >= DHW_SEVERE:
+        reef = is_reef_latitude(latitude)
+        if reef and current is not None:
+            if current >= DHW_SEVERE:
                 component.notes.append(
-                    f"{dhw:.1f} °C-weeks — NOAA severe bleaching with mortality "
-                    f"(>= {DHW_SEVERE:.0f})"
+                    f"{current:.1f} °C-weeks now — NOAA severe bleaching with "
+                    f"mortality (>= {DHW_SEVERE:.0f})"
                 )
-            elif dhw >= DHW_BLEACHING_LIKELY:
+            elif current >= DHW_BLEACHING_LIKELY:
                 component.notes.append(
-                    f"{dhw:.1f} °C-weeks — NOAA significant bleaching likely "
-                    f"(>= {DHW_BLEACHING_LIKELY:.0f})"
+                    f"{current:.1f} °C-weeks now — NOAA significant bleaching "
+                    f"likely (>= {DHW_BLEACHING_LIKELY:.0f})"
                 )
-        else:
+        if not reef:
             # The °C-weeks are a real physical quantity at any latitude; the
             # *scale* they are scored on is derived from coral outcomes, which
             # is worth admitting rather than glossing.
             component.notes.append(
                 "outside reef latitudes: the °C-weeks are real accumulated warm "
-                "anomaly, but the scale is coral-derived and NOAA's bleaching "
-                "bands are not applied here"
+                "anomaly, but both the scale and the recovery decay are derived "
+                "from coral outcomes, so read the magnitude and not the band"
             )
 
-        # The window is the limitation, so it travels with the number.
-        component.notes.append(
-            f"{stress.window_days // 7}-week rolling window: recent accumulation, "
-            "not a record of past damage"
-        )
+        if driving_year is not None and as_of is not None:
+            peak = stress.annual_peak_dhw[driving_year]
+            age = as_of - driving_year
+            component.notes.append(
+                f"strongest surviving event: {peak:.1f} °C-weeks in "
+                f"{driving_year} ({age} y ago), counting at "
+                f"{_recency_weight(age):.0%} of its original weight"
+            )
+            if history_score > current_score:
+                component.notes.append(
+                    "scored on that history, not the current window — the "
+                    "12-week window has since decayed to "
+                    f"{current:.1f} °C-weeks"
+                    if current is not None else
+                    "scored on that history; no current reading available"
+                )
+        elif not stress.annual_peak_dhw:
+            component.notes.append(
+                "no peak history available; scored on the current 12-week "
+                "window alone, which carries no memory of past events"
+            )
+        if stress.worst_dhw is not None and stress.worst_year != driving_year:
+            component.notes.append(
+                f"largest raw event in the window was {stress.worst_dhw:.1f} "
+                f"°C-weeks in {stress.worst_year}"
+            )
+
         if stress.lag_days is not None and stress.lag_days > 0:
             component.notes.append(
-                f"newest OISST observation is {stress.lag_days} d old "
-                "(product publishes ~2 weeks behind)"
+                f"newest CRW observation is {stress.lag_days} d old"
             )
 
         component.detail = {
-            "dhw_c_weeks": round(dhw, 2),
-            "mmm_c": round(stress.mmm_c, 2),
-            "mmm_month": stress.mmm_month,
-            "mmm_source": stress.mmm_source,
+            "current_dhw_c_weeks": (
+                round(current, 2) if current is not None else None
+            ),
+            "worst_dhw_c_weeks": (
+                round(stress.worst_dhw, 2) if stress.worst_dhw is not None else None
+            ),
+            "worst_year": stress.worst_year,
+            "years_since_worst": stress.years_since_worst,
+            "scoring_year": driving_year,
+            "recency_weight": (
+                round(_recency_weight(as_of - driving_year), 3)
+                if driving_year is not None and as_of is not None else None
+            ),
+            "current_score": round(current_score, 1),
+            "history_score": round(history_score, 1),
+            "hotspot_c": (
+                round(stress.hotspot_c, 2) if stress.hotspot_c is not None else None
+            ),
             "latest_sst_c": (
                 round(stress.latest_sst_c, 2)
                 if stress.latest_sst_c is not None else None
             ),
-            "hotspot_c": (
-                round(stress.hotspot_c, 2) if stress.hotspot_c is not None else None
-            ),
-            "observations": stress.observations,
-            "window_days": stress.window_days,
-            "reef_latitude": is_reef_latitude(latitude),
+            "history_years": stress.history_years,
+            "history_observations": stress.history_observations,
+            "reef_latitude": reef,
         }
     except Exception as exc:  # noqa: BLE001 - assess_region has no outer catch
         component.available = False

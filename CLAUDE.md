@@ -282,33 +282,48 @@ returns `(slope, stderr, r²)` and scoring uses **`trend_lower_c_per_decade`**, 
 floored at zero, so only warming that clears its own uncertainty contributes. The point estimate is displayed
 with its error bar but never scored.
 
-**The MMM baseline must be fixed, not rolling (live chain).** Degree Heating Weeks accumulate SST above the
-climatological warmest-month mean. Computing that MMM from a *rolling recent* window — the obvious
-implementation — folds the warming DHW exists to detect into the baseline it is measured against, and the
-component reads ~0 straight through real bleaching events while looking perfectly healthy. Measured on the
-Great Barrier Reef: a rolling ten-year MMM of 29.21 °C reported **0.0 °C-weeks for 2016, 2017, 2022 and 2024**,
-all documented mass-bleaching years, where the fixed 1985-2012 baseline (28.70 °C) scores them 2.2, 5.0, 3.4
-and 1.4. The 0.50 °C difference is the entire signal. `MMM_BASELINE_START`/`_END` are pinned to NOAA Coral
-Reef Watch's 1985-2012 window and `test_mmm_baseline_is_fixed_and_predates_recent_warming` fails if they creep
-forward. The trailing accumulation window is fetched **daily** for the same reason weekly sampling was
-rejected: it misreports DHW by roughly a factor of two in both directions (GBR 2024 read 1.4 weekly vs 2.6
-daily; 2025 read 5.5 vs 4.8), which straddles the threshold and makes the *band* wrong rather than merely
-imprecise.
+**Do not reimplement Degree Heating Weeks — fetch CRW's.** DHW accumulates SST above the climatological
+warmest-month mean (MMM), and getting MMM right is where a local implementation dies. Computing it from a
+*rolling recent* window folds the warming DHW exists to detect into the baseline it is measured against: an
+OISST-derived version of this component reported **0.0 °C-weeks for 2016, 2017, 2022 and 2024** on the Great
+Barrier Reef, all documented mass-bleaching years. Switching to a fixed 1985-2012 baseline fixed the sign of
+the error but not its size — a single 25 km OISST cell smooths away the shallow-reef temperatures that drive
+bleaching, scoring GBR 2024 at 1.4 °C-weeks where NOAA's 5 km product says **7.3**. The component now reads
+`NOAA_DHW` (Coral Reef Watch, 5 km daily) directly, on the ERDDAP host the client already uses, so there is no
+new mirror and no new failure mode. Validated against ground truth: every documented GBR mass-bleaching year
+(2016, 2017, 2020, 2022, 2024) shows up, 2018/2019/2021 correctly read ~0, the Florida Keys' catastrophic 2023
+reads 21.9, and Monterey Bay's 2015 "Blob" reads 28.1.
 
-**DHW is recent accumulation, not a damage record.** The window is 12 weeks, so it decays to zero within a
-season of the event. The Great Barrier Reef in austral winter genuinely reads 0.00 °C-weeks at 4.5 °C below
-its warmest-month mean. That is correct, and it is *not* a memory of the summer that preceded it — the panel
-and the component notes both say so. A true memory term is annual peak DHW per year, which needs a multi-year
-**daily** series (~30 s per 3 years, measured) and is not implemented. Do not describe the current component
-as showing cumulative damage.
+**The 12-week window has no memory; `annual_peak_dhw` is the memory.** CRW's DHW is a rolling 12-week
+accumulation, so it decays to zero within a season of the event — the GBR in austral winter genuinely reads
+0.0 at 4.95 °C *below* its warmest-month mean, which is exactly how it scored LOW while carrying 7.3 °C-weeks
+from two years earlier. `fetch_thermal_stress` therefore also pulls a strided decade of DHW and keeps each
+year's peak. Scoring takes the worse of the current window and the best-scoring *aged* year.
+
+**Age every year, not just the worst one.** `_score_thermal_stress` weighs `_dhw_to_score(peak) ×
+_recency_weight(age)` across the whole history and takes the maximum. Decaying only the single largest year
+lets an old severe event mask a recent near-severe one: on the GBR that scored 12.5, because 2017's 8.6
+°C-weeks are nine years gone and worth 12% of themselves, burying 2024's still-current 7.3. Correct answer is
+94.5. Guarded by `test_an_old_severe_event_cannot_mask_a_recent_one`.
+
+**`_recency_weight` is a modelling choice, not a NOAA standard.** Same epistemic status as
+`PHYLUM_SENSITIVITY`. NOAA calibrates DHW against bleaching *as it happens* and publishes nothing about how
+long the damage should keep counting; `RECENT_EVENT_YEARS`/`RECOVERY_YEARS` (2 and 10) bracket published reef
+recovery times. Argue with the shape, do not present it as sourced.
 
 **DHW's thresholds are coral, its quantity is not.** NOAA's 4 and 8 °C-week thresholds are calibrated against
-observed coral bleaching and mortality. Accumulated warm anomaly is real stress in a kelp forest too, so the
-component scores everywhere, but `is_reef_latitude` (|lat| ≤ 35°) gates the *bleaching wording*: outside that
-band the panel says the °C-weeks are real while the bands do not apply. Of the seven curated regions only
-Florida Keys and O'ahu are reef systems. `CURATED_MMM` holds their precomputed constants — MMM is static, so
-curated regions never pay the climatology fetch; a searched location computes it live (~23 s, context tier,
-disk-cached for the day). Regenerate with `tools/precompute_mmm.py` if a region's box moves.
+observed coral bleaching and mortality. Accumulated warm anomaly is real stress in a kelp forest too (the
+2014-16 north-east Pacific event was measured this way), so the component scores everywhere, but
+`is_reef_latitude` (|lat| ≤ 35°) gates the *bleaching wording* — and note the recovery decay is coral-derived
+as well, so outside the tropics read the magnitude rather than the band. Of the seven curated regions only
+Florida Keys and O'ahu are reef systems.
+
+**CRW rejects a query past the end of its record.** It publishes ~2 days behind and returns a hard **404**
+("your query produced no matching results") rather than clamping, so a fixed lag constant would break the feed
+every time publication slipped. `_dhw_url` emits griddap's `last` keyword for the end index instead, which
+always resolves to the newest available day. The history uses `stride=10` days: DHW is already a 12-week
+rolling accumulation, so its annual peak is a broad feature — measured against a stride-5 reference, stride 10
+moves no annual peak by more than 0.14 °C-weeks and costs ~5 s for eleven years, while stride 20 drifts 0.76.
 
 **Seasonal confounding (Lab chain).** Fitting a line through a seasonal series measures the cycle's phase, not
 its trend: a clean sine sampled over three cycles carries a linear slope of roughly −1 unit/year from its own

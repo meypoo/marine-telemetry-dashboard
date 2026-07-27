@@ -149,7 +149,9 @@ def _fidelity() -> None:
 
     # OISST bars: the renderer draws one per successfully-fetched baseline year,
     # so the count tracks years_covered (up to 10) rather than a fixed 10 — a
-    # year-window can 503 under live conditions.
+    # year-window can 503 under live conditions. The exact class match is what
+    # separates these from the DHW history chart's bars, which carry the extra
+    # ``tm-dhwbar`` marker for exactly this reason.
     bars = body.count('class="tm-bar"')
     years_covered = result.snapshot.climatology.years_covered if result.snapshot.climatology else 0
     # hbar rows: top-6 per composition panel, but each panel tracks what its

@@ -76,40 +76,24 @@ OVERPASS_BUDGET_SECONDS: Final[float] = float(
 RETRY_STATUS: Final[frozenset[int]] = frozenset({408, 425, 429, 500, 502, 503, 504})
 EARTH_RADIUS_KM: Final[float] = 6371.0088
 
-#: OISST publishes roughly two weeks behind real time, so anything reading the
-#: recent end of the record must step back this far to find populated days.
-OISST_LAG_DAYS: Final[int] = 16
-#: Rolling accumulation window for Degree Heating Weeks, per NOAA Coral Reef
-#: Watch. Also the reason DHW is a *recent*-stress measure and not a damage
-#: record: it decays to zero within a season of the event that caused it.
+#: Rolling accumulation window NOAA Coral Reef Watch uses for Degree Heating
+#: Weeks. Documented here because it is *why* current DHW alone cannot answer
+#: "is this reef in trouble": the window decays to zero within a season of the
+#: event, which is what ``annual_peak_dhw`` exists to remember.
 DHW_WINDOW_WEEKS: Final[int] = 12
-#: The FIXED climatology behind MMM. Fixed is load-bearing, not incidental: a
-#: rolling recent window folds in the warming that DHW exists to detect and
-#: silently zeroes the result. Measured on the Great Barrier Reef, a rolling
-#: ten-year MMM (29.21 °C) reported 0.0 °C-weeks for 2016, 2017, 2022 and 2024
-#: — all documented mass-bleaching years — where this fixed baseline (28.70 °C)
-#: scores them 2.2, 5.0, 3.4 and 1.4. The 0.50 °C difference is the whole
-#: signal. NOAA Coral Reef Watch uses 1985-2012 for the same reason.
-MMM_BASELINE_START: Final[date] = date(1985, 1, 1)
-MMM_BASELINE_END: Final[date] = date(2012, 12, 31)
-#: griddap subsampling step for the climatology above. Weekly over 28 years is
-#: ~1460 points in one request (14-35 s measured); monthly means built from
-#: ~120 samples per month are far more than MMM needs.
-MMM_STRIDE_DAYS: Final[int] = 7
-
-#: MMM is a *static* property of a location, so the curated regions carry theirs
-#: as constants and never pay for the climatology fetch. Computed from the fixed
-#: baseline above by ``tools/precompute_mmm.py``; regenerate with that script if
-#: a region's box moves. ``(mmm_c, warmest_month)``.
-CURATED_MMM: Final[dict[str, tuple[float, int]]] = {
-    "MTBY": (14.47, 9),
-    "SCAB": (20.67, 8),
-    "MASS": (18.45, 8),
-    "NYBT": (22.58, 8),
-    "FLKY": (29.92, 8),
-    "HATT": (27.79, 8),
-    "OAHU": (26.67, 9),
-}
+#: How far back the annual-peak history reaches. Ten years spans the published
+#: range for reef recovery from a severe bleaching event.
+DHW_HISTORY_YEARS: Final[int] = 10
+#: griddap subsampling step for the history. DHW is *already* a 12-week rolling
+#: accumulation, so its annual peak is a broad feature and does not need daily
+#: sampling to find — unlike raw SST, where weekly sampling was 2x off.
+#: Measured on the Great Barrier Reef against a stride-5 reference: stride 10
+#: costs 5 s for eleven years and moves no annual peak by more than 0.14
+#: °C-weeks, while stride 20 drifts 0.76 and is too coarse.
+DHW_HISTORY_STRIDE_DAYS: Final[int] = 10
+#: CRW publishes about two days behind, so a short daily tail finds the newest
+#: populated day without a wasted round trip.
+DHW_RECENT_DAYS: Final[int] = 14
 
 #: Degree-Heating-Week thresholds NOAA calibrates against observed coral
 #: bleaching outcomes. They are *coral* thresholds — accumulated warm anomaly
@@ -710,50 +694,61 @@ class ClimatologySnapshot(BaseModel):
 
 
 class ThermalStressSnapshot(BaseModel):
-    """Accumulated heat stress: NOAA Coral Reef Watch Degree Heating Weeks.
+    """Accumulated heat stress, straight from NOAA Coral Reef Watch.
 
     The rest of the thermal chain measures *present* departure from a
     day-of-year baseline, which by construction has no memory: a reef cooked in
     its last warm season sits at a genuinely normal temperature months later and
-    scores clean. DHW is the published, outcome-calibrated answer — HotSpots
-    (SST above the climatological warmest-month mean, counting only excursions
-    of 1 °C or more) accumulated over a rolling 12-week window, in °C-weeks.
+    scores clean. Degree Heating Weeks are the published, outcome-calibrated
+    answer — HotSpots (SST above the climatological warmest-month mean, counting
+    only excursions of 1 °C or more) accumulated over a rolling 12-week window.
 
-    Two properties of this measure are easy to get wrong and are carried as
-    fields rather than assumed:
+    **This is CRW's own product, not a local reimplementation**, and that is
+    deliberate. Computing DHW correctly hinges on the maximum-monthly-mean
+    climatology being *fixed* and properly recentred; deriving it from a rolling
+    recent window — the obvious approach — folds the warming DHW exists to
+    detect into the baseline it is measured against. An OISST-derived version
+    of this component reported 0.0 °C-weeks through four documented Great
+    Barrier Reef mass-bleaching years. CRW does the climatology properly and at
+    5 km, the scale that actually drives bleaching, where a 25 km cell smooths
+    the shallow-reef temperatures away: CRW scores GBR 2024 at 7.3 °C-weeks
+    where the 25 km approximation managed 1.4.
 
-    * ``mmm_c`` **must** come from a fixed historical climatology. Computing it
-      from a rolling recent window folds the warming DHW exists to detect into
-      the baseline it is measured against; verified against the Great Barrier
-      Reef, a rolling ten-year MMM reported 0.0 °C-weeks through four
-      documented mass-bleaching years that a fixed 1985-2012 MMM scores at
-      2.2-5.3.
-    * The window is 12 weeks, so this is *recent* accumulation, not a permanent
-      damage record. It decays to zero within a season of the event.
+    ``dhw_c_weeks`` is the current 12-week window and decays to zero within a
+    season. ``annual_peak_dhw`` is the memory term.
     """
 
     latitude: float | None = None
     longitude: float | None = None
-    #: Maximum monthly mean of the FIXED climatology below, °C.
-    mmm_c: float | None = None
-    #: Calendar month (1-12) the MMM falls in — the location's warmest month.
-    mmm_month: int | None = None
-    #: Provenance of ``mmm_c``: a committed constant or a live computation.
-    mmm_source: str | None = None
-    #: Newest SST in the trailing window and the day it was measured.
+    #: Current 12-week accumulation, °C-weeks. NOAA's calibration: >=4
+    #: significant bleaching likely, >=8 severe bleaching with mortality.
+    dhw_c_weeks: float | None = None
+    #: CRW's own HotSpot for the same day: SST above the warmest-month mean.
+    hotspot_c: float | None = None
+    #: CRW sea-surface temperature for the newest day, °C.
     latest_sst_c: float | None = None
     latest_day: date | None = None
-    #: ``latest_sst_c - mmm_c``. Positive means above the warmest-month mean.
-    hotspot_c: float | None = None
-    #: Accumulated °C-weeks across the trailing window. NOAA's calibration:
-    #: >=4 significant bleaching likely, >=8 severe bleaching with mortality.
-    dhw_c_weeks: float | None = None
-    #: Daily observations actually used, and the window they were drawn from.
-    observations: int = 0
-    window_days: int = 84
-    #: Age of the newest observation in days. OISST publishes ~2 weeks behind,
-    #: so DHW is necessarily slightly stale; stated rather than hidden.
+    #: Age of the newest observation in days. CRW publishes ~2 days behind.
     lag_days: int | None = None
+
+    #: Highest DHW reached in each year of the history window. This is the
+    #: memory the 12-week window cannot hold — the record of what a location has
+    #: already been through, which for a reef is the question that matters.
+    annual_peak_dhw: dict[int, float] = Field(default_factory=dict)
+    #: Worst year in that history and its peak, for display. Note this is the
+    #: worst *raw* year — scoring weighs every year by recency and may well be
+    #: driven by a different, more recent one.
+    worst_year: int | None = None
+    worst_dhw: float | None = None
+    #: Whole years between ``worst_year`` and now.
+    years_since_worst: int | None = None
+    #: The year the history was taken in, so a consumer can age every entry of
+    #: ``annual_peak_dhw`` rather than only the worst one.
+    as_of_year: int | None = None
+    #: Samples behind the history, and how many years it was asked to cover.
+    history_observations: int = 0
+    history_years: int = DHW_HISTORY_YEARS
+    window_days: int = DHW_WINDOW_WEEKS * 7
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -810,6 +805,10 @@ class ErddapClient(_BaseClient):
     BUOY_DATASET: Final[str] = "cwwcNDBCMet"
     SST_DATASET: Final[str] = "ncdcOisst21Agg_LonPM180"
     SST_DATASET_FALLBACK: Final[str] = "ncdcOisst21Agg"
+    #: NOAA Coral Reef Watch 5 km daily DHW, on the same host. ``NOAA_DHW``
+    #: takes -180-180 longitude; the ``_Lon0360`` twin takes 0-360.
+    DHW_DATASET: Final[str] = "NOAA_DHW"
+    DHW_DATASET_FALLBACK: Final[str] = "NOAA_DHW_Lon0360"
 
     # ---------------------------- buoys ----------------------------------- #
     async def discover_stations(
@@ -1004,21 +1003,12 @@ class ErddapClient(_BaseClient):
         )
 
     # ------------------------- OISST climatology --------------------------- #
-    def _sst_url(
-        self, dataset: str, lat: float, lon: float, start: date, end: date,
-        *, stride: int = 1,
-    ) -> str:
-        """griddap URL for one cell over a date range.
-
-        ``stride`` is griddap's own subsampling step, in days. It is what makes
-        a multi-decade climatology affordable: 1985-2012 at ``stride=7`` is one
-        request of ~1460 points instead of ten thousand, which is ample for
-        monthly means and therefore for MMM.
-        """
+    def _sst_url(self, dataset: str, lat: float, lon: float,
+                 start: date, end: date) -> str:
         query_lon = lon if "LonPM180" in dataset else (lon % 360.0)
         return (
             f"{self.BASE}/griddap/{dataset}.json"
-            f"?sst%5B({start.isoformat()}T12:00:00Z):{stride}:({end.isoformat()}T12:00:00Z)%5D"
+            f"?sst%5B({start.isoformat()}T12:00:00Z):1:({end.isoformat()}T12:00:00Z)%5D"
             f"%5B(0.0):1:(0.0)%5D"
             f"%5B({lat:.4f}):1:({lat:.4f})%5D"
             f"%5B({query_lon:.4f}):1:({query_lon:.4f})%5D"
@@ -1149,115 +1139,113 @@ class ErddapClient(_BaseClient):
             years_requested=years,
         )
 
-    async def _sst_series(
-        self,
-        lat: float,
-        lon: float,
-        start: date,
-        end: date,
-        *,
-        label: str,
-        stride: int = 1,
-        timeout: float = 90.0,
-    ) -> list[tuple[date, float, float, float]]:
-        """One grid cell's SST over a range: [(day, sst, grid_lat, grid_lon)].
+    def _dhw_url(
+        self, dataset: str, variables: Sequence[str], lat: float, lon: float,
+        start: date, end: date | None = None, *, stride: int = 1,
+    ) -> str:
+        """griddap URL for CRW variables at one cell.
 
-        Null values are dropped rather than zero-filled — over an ocean cell
-        they are missing days, and over a land cell *every* value is null,
-        which the caller must be able to see as "no data" rather than "0 °C".
+        Three dimensions here — ``NOAA_DHW`` has no ``zlev``, unlike the OISST
+        datasets above.
+
+        ``end=None`` emits griddap's ``last`` keyword rather than a date, and
+        that is the correct default. CRW publishes a couple of days behind, and
+        asking for a day past the end of the record is **not** clamped — ERDDAP
+        returns a hard 404 ("your query produced no matching results"), so a
+        fixed lag constant would silently break the feed every time publication
+        slipped. ``last`` always resolves to the newest available day.
         """
-        url = self._sst_url(self.SST_DATASET, lat, lon, start, end, stride=stride)
+        query_lon = lon if dataset == self.DHW_DATASET else (lon % 360.0)
+        end_token = f"({end.isoformat()}T12:00:00Z)" if end is not None else "last"
+        slice_ = (
+            f"%5B({start.isoformat()}T12:00:00Z):{stride}:{end_token}%5D"
+            f"%5B({lat:.4f}):1:({lat:.4f})%5D"
+            f"%5B({query_lon:.4f}):1:({query_lon:.4f})%5D"
+        )
+        return (
+            f"{self.BASE}/griddap/{dataset}.json?"
+            + ",".join(f"{v}{slice_}" for v in variables)
+        )
+
+    async def _dhw_series(
+        self, variables: Sequence[str], lat: float, lon: float,
+        start: date, end: date | None = None, *, label: str, stride: int = 1,
+        timeout: float = 120.0,
+    ) -> list[list[Any]]:
+        """CRW rows for one cell: ``[time, latitude, longitude, *variables]``.
+
+        Rows whose first requested variable is null are dropped — over a land
+        cell every value is null, which the caller must be able to read as "no
+        data" rather than "0 °C-weeks", the one value that would look calm.
+        """
+        url = self._dhw_url(self.DHW_DATASET, variables, lat, lon, start, end,
+                            stride=stride)
         try:
             response = await self._fetch(url, label, timeout=timeout)
         except ApiError:
-            url = self._sst_url(
-                self.SST_DATASET_FALLBACK, lat, lon, start, end, stride=stride
-            )
+            url = self._dhw_url(self.DHW_DATASET_FALLBACK, variables, lat, lon,
+                                start, end, stride=stride)
             response = await self._fetch(url, f"{label}/alt", timeout=timeout)
-
-        out: list[tuple[date, float, float, float]] = []
-        for row in response.json()["table"]["rows"]:
-            if row[4] is None:
-                continue
-            out.append(
-                (date.fromisoformat(row[0][:10]), float(row[4]),
-                 float(row[2]), float(row[3]))
-            )
-        return out
+        return [r for r in response.json()["table"]["rows"] if r[3] is not None]
 
     async def fetch_thermal_stress(
         self,
         region: Region,
         *,
-        window_weeks: int = DHW_WINDOW_WEEKS,
+        history_years: int = DHW_HISTORY_YEARS,
         anchor: date | None = None,
     ) -> ThermalStressSnapshot:
-        """Degree Heating Weeks for a region, NOAA Coral Reef Watch convention.
+        """Degree Heating Weeks from NOAA Coral Reef Watch, current and historic.
 
-        Two requests at most: the fixed climatology behind MMM (skipped
-        entirely for a curated region, whose MMM is a committed constant) and
-        the trailing daily window the accumulation runs over.
+        Two requests: a short daily tail for the current reading, and a strided
+        pass over the history for the annual peaks. Both hit ``NOAA_DHW`` on the
+        ERDDAP host this client already uses, so no new mirror, no new failure
+        mode, and the existing retry/rotate machinery applies unchanged.
 
-        The trailing window is fetched at **daily** resolution deliberately.
-        Sampling it weekly to save a few seconds misreports the result by
-        roughly a factor of two in both directions — measured against the Great
-        Barrier Reef, 2024 read 1.4 °C-weeks weekly against 2.6 daily, and 2025
-        read 5.5 against 4.8 — which straddles NOAA's bleaching threshold and
-        would make the band wrong rather than merely imprecise.
+        The history is what makes the index able to answer "has this place been
+        cooked recently". Current DHW cannot: its window is 12 weeks, so a reef
+        in the cool season that bleached last summer reads a genuine 0.0.
         """
         lat, lon = region.centroid
         anchor = anchor or datetime.now(timezone.utc).date()
-        snapshot = ThermalStressSnapshot(window_days=window_weeks * 7)
+        snapshot = ThermalStressSnapshot(history_years=history_years)
 
-        curated = CURATED_MMM.get(region.code)
-        if curated is not None:
-            snapshot.mmm_c, snapshot.mmm_month = curated
-            snapshot.mmm_source = (
-                f"committed constant, {MMM_BASELINE_START.year}-"
-                f"{MMM_BASELINE_END.year} OISST"
-            )
-        else:
-            climatology = await self._sst_series(
-                lat, lon, MMM_BASELINE_START, MMM_BASELINE_END,
-                label="oisst/mmm", stride=MMM_STRIDE_DAYS, timeout=240.0,
-            )
-            monthly: dict[int, list[float]] = {}
-            for day, value, _, _ in climatology:
-                monthly.setdefault(day.month, []).append(value)
-            if monthly:
-                means = {m: sum(v) / len(v) for m, v in monthly.items()}
-                snapshot.mmm_month = max(means, key=lambda m: means[m])
-                # Rounded to match the precision of the committed constants, so
-                # a searched location and a curated one report MMM alike.
-                snapshot.mmm_c = round(means[snapshot.mmm_month], 2)
-                snapshot.mmm_source = (
-                    f"computed from {MMM_BASELINE_START.year}-"
-                    f"{MMM_BASELINE_END.year} OISST"
-                )
-
-        # No MMM means no reference point; return the empty shell so the
-        # component reports itself unavailable instead of scoring on nothing.
-        if snapshot.mmm_c is None:
-            return snapshot
-
-        end = anchor - timedelta(days=OISST_LAG_DAYS)
-        recent = await self._sst_series(
-            lat, lon, end - timedelta(days=window_weeks * 7), end, label="oisst/dhw",
+        recent = await self._dhw_series(
+            ("CRW_DHW", "CRW_HOTSPOT", "CRW_SST"), lat, lon,
+            anchor - timedelta(days=DHW_RECENT_DAYS), label="crw/dhw",
         )
-        if not recent:
-            return snapshot
+        if recent:
+            row = recent[-1]
+            snapshot.latitude, snapshot.longitude = float(row[1]), float(row[2])
+            snapshot.latest_day = date.fromisoformat(row[0][:10])
+            snapshot.lag_days = (anchor - snapshot.latest_day).days
+            snapshot.dhw_c_weeks = float(row[3])
+            snapshot.hotspot_c = float(row[4]) if row[4] is not None else None
+            snapshot.latest_sst_c = float(row[5]) if row[5] is not None else None
 
-        snapshot.observations = len(recent)
-        latest_day, latest_sst, grid_lat, grid_lon = recent[-1]
-        snapshot.latitude, snapshot.longitude = grid_lat, grid_lon
-        snapshot.latest_day, snapshot.latest_sst_c = latest_day, latest_sst
-        snapshot.lag_days = (anchor - latest_day).days
-        snapshot.hotspot_c = latest_sst - snapshot.mmm_c
+        # History failing must not cost the current reading, and vice versa —
+        # they answer different questions and either alone is worth showing.
+        try:
+            history = await self._dhw_series(
+                ("CRW_DHW",), lat, lon,
+                date(anchor.year - history_years, 1, 1),
+                label="crw/dhw-history", stride=DHW_HISTORY_STRIDE_DAYS,
+                timeout=180.0,
+            )
+        except ApiError:
+            history = []
 
-        # NOAA's definition: only excursions of >=1 °C above MMM accumulate.
-        # Daily readings, so each contributes a seventh of a °C-week.
-        hotspots = [value - snapshot.mmm_c for _, value, _, _ in recent]
-        snapshot.dhw_c_weeks = sum(h for h in hotspots if h >= 1.0) / 7.0
+        peaks: dict[int, float] = {}
+        for row in history:
+            year = int(row[0][:4])
+            peaks[year] = max(peaks.get(year, 0.0), float(row[3]))
+        if peaks:
+            snapshot.annual_peak_dhw = dict(sorted(peaks.items()))
+            snapshot.history_observations = len(history)
+            snapshot.as_of_year = anchor.year
+            snapshot.worst_year = max(peaks, key=lambda y: peaks[y])
+            snapshot.worst_dhw = peaks[snapshot.worst_year]
+            snapshot.years_since_worst = anchor.year - snapshot.worst_year
         return snapshot
 
 
