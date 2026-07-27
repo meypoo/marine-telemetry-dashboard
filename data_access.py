@@ -14,7 +14,7 @@ crash the page. Every load returns a :class:`LoadResult`:
 The staleness is always reported rather than hidden: ``LoadResult.stale`` drives
 the LIVE/STALE indicator, and ``error`` carries the reason the refresh failed.
 
-**Volatility-tiered caching.** The five feeds age at very different rates, so
+**Volatility-tiered caching.** The six feeds age at very different rates, so
 they are cached in two tiers rather than as one blob:
 
 * the *dynamic* tier — in-situ buoy and model SST — changes in minutes to hours
@@ -66,7 +66,12 @@ _T = TypeVar("_T")
 #: Feeds that change fast (minutes-hours): re-fetched on every timed refresh.
 DYNAMIC_FEEDS = ("buoy", "sea_state")
 #: Feeds that are stable within a day: fetched roughly once per UTC day.
-CONTEXT_FEEDS = ("climatology", "obis", "infrastructure")
+#: ``thermal_stress`` belongs here rather than in the dynamic tier even though
+#: it reads the recent end of the record: OISST publishes ~2 weeks behind, so
+#: the newest day it can return does not change between refreshes, and its
+#: accumulation window is 12 weeks wide. Re-pulling it on every REFRESH would
+#: buy nothing and cost a request.
+CONTEXT_FEEDS = ("climatology", "thermal_stress", "obis", "infrastructure")
 
 #: TTLs matched to volatility; overridable for deployments with different
 #: refresh economics (values in seconds). The context tier's real invalidation

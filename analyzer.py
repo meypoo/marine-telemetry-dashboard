@@ -38,12 +38,16 @@ from typing import Any, Final
 from pydantic import BaseModel, Field
 
 from api_clients import (
+    DHW_BLEACHING_LIKELY,
+    DHW_SEVERE,
     BuoySnapshot,
     ClimatologySnapshot,
     InfrastructureSnapshot,
     ObisSnapshot,
     RegionSnapshot,
     SeaStateSnapshot,
+    ThermalStressSnapshot,
+    is_reef_latitude,
 )
 
 __all__ = [
@@ -56,8 +60,14 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # Tunable constants
 # --------------------------------------------------------------------------- #
+#: The thermal budget is 0.45 and always has been; what changed is that it is
+#: now *split* between the instantaneous reading and the accumulated one,
+#: rather than resting entirely on "how hot is it right now". Taxonomic and
+#: pressure are untouched, so a score moves only because a genuinely new signal
+#: entered the thermal half — not because every weight was re-editorialised.
 NOMINAL_WEIGHTS: Final[dict[str, float]] = {
-    "thermal": 0.45,
+    "thermal": 0.25,
+    "thermal_stress": 0.20,
     "taxonomic": 0.30,
     "pressure": 0.25,
 }
@@ -330,7 +340,114 @@ def _score_thermal(
 
 
 # --------------------------------------------------------------------------- #
-# Component 2 — taxonomic exposure
+# Component 2 — accumulated thermal stress (Degree Heating Weeks)
+# --------------------------------------------------------------------------- #
+def _score_thermal_stress(
+    stress: ThermalStressSnapshot | None, latitude: float
+) -> ComponentScore:
+    """Score accumulated heat stress, NOAA Coral Reef Watch Degree Heating Weeks.
+
+    This is the only component with an *outcome-calibrated* scale: NOAA fixes
+    4 °C-weeks as "significant bleaching likely" and 8 as "severe bleaching
+    with mortality", both validated against observed reef mortality. The score
+    is anchored on exactly those two points — 4 maps to 70, the bottom of this
+    dashboard's CRITICAL band, and 8 maps to 100 — so the number the panel
+    shows and the number the published scale means are the same number.
+
+    The *bands* are coral-specific; the underlying quantity is not. Accumulated
+    warm anomaly is real stress in a kelp forest too (the 2014-16 north-east
+    Pacific event was measured this way), so it is scored everywhere and only
+    the bleaching wording is gated on latitude.
+    """
+    component = ComponentScore(
+        key="thermal_stress",
+        label="ACCUMULATED HEAT STRESS",
+        weight=NOMINAL_WEIGHTS["thermal_stress"],
+    )
+    try:
+        if stress is None:
+            component.unavailable_reason = "OISST thermal-stress fetch failed"
+            return component
+        if stress.mmm_c is None:
+            component.unavailable_reason = (
+                "no fixed-baseline climatology for this location"
+            )
+            return component
+        if stress.dhw_c_weeks is None or stress.observations == 0:
+            component.unavailable_reason = "no recent SST in the accumulation window"
+            return component
+
+        dhw = stress.dhw_c_weeks
+        if dhw <= DHW_BLEACHING_LIKELY:
+            score = dhw / DHW_BLEACHING_LIKELY * 70.0
+        else:
+            span = DHW_SEVERE - DHW_BLEACHING_LIKELY
+            score = 70.0 + (dhw - DHW_BLEACHING_LIKELY) / span * 30.0
+
+        component.score = _clamp(score)
+        component.available = True
+        # Coverage of the window is the honest quality signal: a partly-filled
+        # window under-accumulates and would read as calm rather than unknown.
+        component.quality = _clamp(
+            stress.observations / max(1, stress.window_days), 0.0, 1.0
+        )
+
+        if is_reef_latitude(latitude):
+            if dhw >= DHW_SEVERE:
+                component.notes.append(
+                    f"{dhw:.1f} °C-weeks — NOAA severe bleaching with mortality "
+                    f"(>= {DHW_SEVERE:.0f})"
+                )
+            elif dhw >= DHW_BLEACHING_LIKELY:
+                component.notes.append(
+                    f"{dhw:.1f} °C-weeks — NOAA significant bleaching likely "
+                    f"(>= {DHW_BLEACHING_LIKELY:.0f})"
+                )
+        else:
+            # The °C-weeks are a real physical quantity at any latitude; the
+            # *scale* they are scored on is derived from coral outcomes, which
+            # is worth admitting rather than glossing.
+            component.notes.append(
+                "outside reef latitudes: the °C-weeks are real accumulated warm "
+                "anomaly, but the scale is coral-derived and NOAA's bleaching "
+                "bands are not applied here"
+            )
+
+        # The window is the limitation, so it travels with the number.
+        component.notes.append(
+            f"{stress.window_days // 7}-week rolling window: recent accumulation, "
+            "not a record of past damage"
+        )
+        if stress.lag_days is not None and stress.lag_days > 0:
+            component.notes.append(
+                f"newest OISST observation is {stress.lag_days} d old "
+                "(product publishes ~2 weeks behind)"
+            )
+
+        component.detail = {
+            "dhw_c_weeks": round(dhw, 2),
+            "mmm_c": round(stress.mmm_c, 2),
+            "mmm_month": stress.mmm_month,
+            "mmm_source": stress.mmm_source,
+            "latest_sst_c": (
+                round(stress.latest_sst_c, 2)
+                if stress.latest_sst_c is not None else None
+            ),
+            "hotspot_c": (
+                round(stress.hotspot_c, 2) if stress.hotspot_c is not None else None
+            ),
+            "observations": stress.observations,
+            "window_days": stress.window_days,
+            "reef_latitude": is_reef_latitude(latitude),
+        }
+    except Exception as exc:  # noqa: BLE001 - assess_region has no outer catch
+        component.available = False
+        component.unavailable_reason = f"scoring failed ({type(exc).__name__})"
+    return component
+
+
+# --------------------------------------------------------------------------- #
+# Component 3 — taxonomic exposure
 # --------------------------------------------------------------------------- #
 def _score_taxonomic(obis: ObisSnapshot | None) -> ComponentScore:
     """Weight the observed assemblage by phylum-level sensitivity and evenness."""
@@ -407,7 +524,7 @@ def _score_taxonomic(obis: ObisSnapshot | None) -> ComponentScore:
 
 
 # --------------------------------------------------------------------------- #
-# Component 3 — anthropogenic pressure
+# Component 4 — anthropogenic pressure
 # --------------------------------------------------------------------------- #
 def _score_pressure(infra: InfrastructureSnapshot | None) -> ComponentScore:
     """Score vessel-activity pressure from seamark density and composition."""
@@ -492,9 +609,12 @@ def assess_region(snapshot: RegionSnapshot) -> StressAssessment:
     thermal, thermal_context = _score_thermal(
         snapshot.climatology, snapshot.buoy, snapshot.sea_state
     )
+    thermal_stress = _score_thermal_stress(
+        snapshot.thermal_stress, snapshot.region.centroid[0]
+    )
     taxonomic = _score_taxonomic(snapshot.obis)
     pressure = _score_pressure(snapshot.infrastructure)
-    assessment.components = [thermal, taxonomic, pressure]
+    assessment.components = [thermal, thermal_stress, taxonomic, pressure]
 
     assessment.current_sst_c = thermal_context.get("current_sst_c")
     assessment.sst_source = thermal_context.get("sst_source")

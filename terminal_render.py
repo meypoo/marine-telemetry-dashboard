@@ -18,9 +18,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
 from analyzer import StressAssessment
-from api_clients import BuoySnapshot, Region, RegionSnapshot
+from api_clients import (
+    DHW_BLEACHING_LIKELY, DHW_SEVERE, BuoySnapshot, Region, RegionSnapshot,
+    is_reef_latitude,
+)
 from ui import (
-    BORDER_STRONG, CANOPY, INK, LINE, MIST, PAPER, PAPER_DIM, SIGNAL,
+    BORDER_STRONG, CANOPY, INK, LINE, MIST, PANEL, PAPER, PAPER_DIM, SIGNAL,
     SOURCE_COLOURS, TerminalConfig, bidi_isolate, esc, fmt, gloss_attr,
     stress_accent,
 )
@@ -31,7 +34,9 @@ __all__ = [
 ]
 SOURCES_LINE = (
     "SOURCES: NOAA ERDDAP coastwatch.pfeg.noaa.gov (cwwcNDBCMet in-situ buoy, "
-    "ncdcOisst21Agg OISST v2.1 day-of-year baseline) · Open-Meteo Marine "
+    "ncdcOisst21Agg OISST v2.1 day-of-year baseline, and 1985-2012 fixed "
+    "climatology for Degree Heating Weeks after NOAA Coral Reef Watch) · "
+    "Open-Meteo Marine "
     "marine-api.open-meteo.com (model SST) · OBIS api.obis.org/v3 (occurrence "
     "statistics and taxonomic checklist) · OpenSeaMap via Overpass "
     "overpass-api.de (charted seamarks). Stress score is computed from these "
@@ -998,6 +1003,127 @@ def _stats_strip(snapshot: RegionSnapshot, assessment: StressAssessment,
     )
 
 
+#: Full scale of the DHW gauge, in °C-weeks. Chosen so NOAA's two calibrated
+#: thresholds (4 and 8) land at a third and two thirds of the track rather than
+#: at its very end, which would make a severe reading indistinguishable from an
+#: off-scale one.
+_DHW_GAUGE_MAX = 12.0
+
+
+def _thermal_stress_panel(snapshot: RegionSnapshot,
+                          assessment: StressAssessment) -> str:
+    """Degree Heating Weeks against NOAA's two calibrated thresholds.
+
+    The gauge exists because this is the only component whose number means
+    something outside this dashboard: 4 °C-weeks is "bleaching likely" and 8 is
+    "severe with mortality" in NOAA's published calibration, so the reading is
+    drawn against those marks rather than against an arbitrary 0-100.
+    """
+    stress = snapshot.thermal_stress
+    component = assessment.component("thermal_stress")
+    chip = _chip("ACCUMULATED HEAT STRESS — DEGREE HEATING WEEKS", block=True)
+
+    if stress is None or stress.dhw_c_weeks is None or stress.mmm_c is None:
+        reason = (
+            component.unavailable_reason
+            if component is not None and component.unavailable_reason
+            else "thermal-stress feed unavailable"
+        )
+        return (
+            '<section>' + chip
+            + f'<div class="tm-mist" style="font-size:11.5px;margin-top:10px">'
+            f"{esc(reason)}</div></section>"
+        )
+
+    dhw = stress.dhw_c_weeks
+    latitude = snapshot.region.centroid[0]
+    reef = is_reef_latitude(latitude)
+    fill_pct = min(100.0, dhw / _DHW_GAUGE_MAX * 100.0)
+    accent = SIGNAL if (reef and dhw >= DHW_BLEACHING_LIKELY) else CANOPY
+
+    def mark(value: float, label: str) -> str:
+        left = value / _DHW_GAUGE_MAX * 100.0
+        return (
+            f'<div style="position:absolute;left:{left:.1f}%;top:0;bottom:0;'
+            f'width:1px;background:{BORDER_STRONG}"></div>'
+            f'<div style="position:absolute;left:{left:.1f}%;top:18px;'
+            f'font-size:9.5px;color:{MIST};transform:translateX(-50%);'
+            f'white-space:nowrap">{esc(label)}</div>'
+        )
+
+    gauge = (
+        '<div style="margin-top:12px">'
+        f'<div style="position:relative;height:16px;background:{PANEL}">'
+        f'<div style="width:{fill_pct:.1f}%;height:16px;background:{accent}"></div>'
+        + mark(DHW_BLEACHING_LIKELY, f"{DHW_BLEACHING_LIKELY:.0f} bleaching likely")
+        + mark(DHW_SEVERE, f"{DHW_SEVERE:.0f} severe")
+        + '</div>'
+        f'<div style="height:26px"></div>'
+        '</div>'
+    )
+
+    # State the interpretation in words, because the gauge marks are coral
+    # calibration and a reader outside the tropics should not apply them.
+    if not reef:
+        verdict = (
+            "outside reef latitudes — real accumulated warm anomaly, but NOAA's "
+            "bleaching bands do not apply here"
+        )
+    elif dhw >= DHW_SEVERE:
+        verdict = "at or above NOAA severe: bleaching with mortality expected"
+    elif dhw >= DHW_BLEACHING_LIKELY:
+        verdict = "at or above NOAA threshold: significant bleaching likely"
+    else:
+        verdict = "below NOAA's bleaching threshold in the current window"
+
+    rows = [
+        _row("Degree heating weeks", f"{dhw:.2f} °C-weeks",
+             colour=accent, small_key=True, medium_value=True),
+        _row("Warmest-month mean (MMM)",
+             f"{stress.mmm_c:.2f} °C"
+             + (f" · month {stress.mmm_month}" if stress.mmm_month else ""),
+             small_key=True, medium_value=True),
+        _row("Latest SST", fmt(stress.latest_sst_c, ".2f", " °C"),
+             small_key=True, medium_value=True),
+        _row("HotSpot vs MMM",
+             fmt(stress.hotspot_c, "+.2f", " °C")
+             + (" ▲" if (stress.hotspot_c or 0) >= 1.0 else ""),
+             colour=SIGNAL if (stress.hotspot_c or 0) >= 1.0 else PAPER,
+             small_key=True, medium_value=True),
+        _row("Accumulation window",
+             f"{stress.window_days // 7} weeks · {stress.observations} daily obs",
+             small_key=True, medium_value=True),
+    ]
+
+    detail_pairs = [
+        ("MMM source", stress.mmm_source or "--"),
+        ("MMM (°C)", f"{stress.mmm_c:.2f}"),
+        ("warmest month", str(stress.mmm_month or "--")),
+        ("latest observation", str(stress.latest_day or "--")),
+        ("observation lag (days)", str(stress.lag_days if stress.lag_days is not None else "--")),
+        ("daily observations", str(stress.observations)),
+        ("window (days)", str(stress.window_days)),
+        ("grid cell", f"{stress.latitude}, {stress.longitude}"),
+        ("reef latitude", "yes" if reef else "no"),
+    ]
+    notes = "".join(
+        f'<div class="tm-mist" style="font-size:10.5px;line-height:1.5;'
+        f'margin-top:4px">· {esc(n)}</div>'
+        for n in (component.notes if component is not None else [])
+    )
+    drawer = _drawer(
+        "DEGREE HEATING WEEK DERIVATION", _detail_rows(detail_pairs) + notes
+    )
+
+    return (
+        '<section>' + chip + gauge + "".join(rows)
+        + f'<div class="tm-mist" style="font-size:10.5px;line-height:1.5;'
+        f'margin-top:8px">{esc(verdict)}</div>'
+        + drawer
+        + "</section>"
+    )
+
+
 def _console(snapshot: RegionSnapshot) -> str:
     events = snapshot.telemetry
     latencies = sorted(e.latency_ms for e in events)
@@ -1277,6 +1403,7 @@ def render_body(
     region = snapshot.region
     main_sections = [
         _sst_panel(snapshot, assessment, region),
+        _thermal_stress_panel(snapshot, assessment),
         _baseline_panel(snapshot, assessment),
         _composition_panels(snapshot),
     ]

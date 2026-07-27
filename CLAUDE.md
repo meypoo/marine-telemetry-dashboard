@@ -13,7 +13,7 @@ streamlit run app.py                            # dashboard on :8501 (Live Index
 python tests/run_all.py                         # full suite (offline + live)
 python tests/run_all.py --offline               # fast, deterministic, no network
 
-python api_clients.py MTBY                      # transport smoke test: one region, all 5 feeds + telemetry
+python api_clients.py MTBY                      # transport smoke test: one region, all 6 feeds + telemetry
 python analyzer.py MTBY                         # live pipeline: fetch + score, component breakdown
 python ml_analysis.py path/to/observations.csv  # Data Lab engine against a local file
 python geocoding.py "Monterey Bay"              # geocoder / lat-lon parser check
@@ -72,13 +72,15 @@ ml_analysis.py ────────────────┘        ├→
                                    shared: ui.py, data_access.py
 ```
 
-**Live chain.** `api_clients.fetch_region_snapshot()` opens one `httpx.AsyncClient` and gathers five feeds
+**Live chain.** `api_clients.fetch_region_snapshot()` opens one `httpx.AsyncClient` and gathers six feeds
 concurrently with `return_exceptions=True`, so a dead source degrades the result instead of aborting it.
 `_BaseClient._fetch` handles retry-with-backoff then mirror rotation, recording a `TelemetryEvent` for *every*
 attempt including failures; that sink is what the console feed renders, so the log is measured rather than
-narrated. `analyzer.assess_region()` blends three components (thermal 0.45, taxonomic 0.30, pressure 0.25),
-each computed inside its own `try/except` — there is deliberately **no outer catch** in `assess_region`, so a
-new component must carry its own guard. Unavailable components are dropped and the surviving weights
+narrated. `analyzer.assess_region()` blends four components (thermal 0.25, accumulated thermal stress 0.20,
+taxonomic 0.30, pressure 0.25), each computed inside its own `try/except` — there is deliberately **no outer
+catch** in `assess_region`, so a new component must carry its own guard. The thermal budget is still 0.45 in
+total; what changed when DHW landed is that it is *split* between the instantaneous reading and the
+accumulated one, leaving taxonomic and pressure untouched. Unavailable components are dropped and the surviving weights
 **renormalised**, so the score stays comparable; it is either backed by real observations or `None`.
 
 A `FeedBundle` becomes a `RegionSnapshot` in exactly one place, `api_clients.snapshot_from_bundle()`. Both the
@@ -184,7 +186,7 @@ The dashboard is expected to run overnight with nobody watching, so failures deg
 
 - `page_live.py` wraps the whole page in `st.fragment(run_every=...)`, set to the data cache TTL plus a
   margin so each timed rerun pulls genuinely fresh data instead of re-rendering the same cached snapshot.
-- **Volatility-tiered caching.** The five feeds age at very different rates, so `data_access` caches them in
+- **Volatility-tiered caching.** The six feeds age at very different rates, so `data_access` caches them in
   two tiers and composes the `RegionSnapshot`: a *dynamic* tier (buoy + model SST) cached ~10 min and keyed by
   `(code, refresh-generation)` so REFRESH re-pulls it, and a *context* tier (OISST baseline + OBIS + Overpass)
   keyed by `(code, UTC-date)` and cached a day, since it is stable within a day. A timed refresh then re-fetches only
@@ -279,6 +281,34 @@ estimates of 1.5 °C/decade appear routinely, an order of magnitude above anythi
 returns `(slope, stderr, r²)` and scoring uses **`trend_lower_c_per_decade`**, the one-sided ~95 % lower bound
 floored at zero, so only warming that clears its own uncertainty contributes. The point estimate is displayed
 with its error bar but never scored.
+
+**The MMM baseline must be fixed, not rolling (live chain).** Degree Heating Weeks accumulate SST above the
+climatological warmest-month mean. Computing that MMM from a *rolling recent* window — the obvious
+implementation — folds the warming DHW exists to detect into the baseline it is measured against, and the
+component reads ~0 straight through real bleaching events while looking perfectly healthy. Measured on the
+Great Barrier Reef: a rolling ten-year MMM of 29.21 °C reported **0.0 °C-weeks for 2016, 2017, 2022 and 2024**,
+all documented mass-bleaching years, where the fixed 1985-2012 baseline (28.70 °C) scores them 2.2, 5.0, 3.4
+and 1.4. The 0.50 °C difference is the entire signal. `MMM_BASELINE_START`/`_END` are pinned to NOAA Coral
+Reef Watch's 1985-2012 window and `test_mmm_baseline_is_fixed_and_predates_recent_warming` fails if they creep
+forward. The trailing accumulation window is fetched **daily** for the same reason weekly sampling was
+rejected: it misreports DHW by roughly a factor of two in both directions (GBR 2024 read 1.4 weekly vs 2.6
+daily; 2025 read 5.5 vs 4.8), which straddles the threshold and makes the *band* wrong rather than merely
+imprecise.
+
+**DHW is recent accumulation, not a damage record.** The window is 12 weeks, so it decays to zero within a
+season of the event. The Great Barrier Reef in austral winter genuinely reads 0.00 °C-weeks at 4.5 °C below
+its warmest-month mean. That is correct, and it is *not* a memory of the summer that preceded it — the panel
+and the component notes both say so. A true memory term is annual peak DHW per year, which needs a multi-year
+**daily** series (~30 s per 3 years, measured) and is not implemented. Do not describe the current component
+as showing cumulative damage.
+
+**DHW's thresholds are coral, its quantity is not.** NOAA's 4 and 8 °C-week thresholds are calibrated against
+observed coral bleaching and mortality. Accumulated warm anomaly is real stress in a kelp forest too, so the
+component scores everywhere, but `is_reef_latitude` (|lat| ≤ 35°) gates the *bleaching wording*: outside that
+band the panel says the °C-weeks are real while the bands do not apply. Of the seven curated regions only
+Florida Keys and O'ahu are reef systems. `CURATED_MMM` holds their precomputed constants — MMM is static, so
+curated regions never pay the climatology fetch; a searched location computes it live (~23 s, context tier,
+disk-cached for the day). Regenerate with `tools/precompute_mmm.py` if a region's box moves.
 
 **Seasonal confounding (Lab chain).** Fitting a line through a seasonal series measures the cycle's phase, not
 its trend: a clean sine sampled over three cycles carries a linear slope of roughly −1 unit/year from its own

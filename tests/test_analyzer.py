@@ -10,7 +10,7 @@ assert the arithmetic directly. No network.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,7 +21,7 @@ from analyzer import (  # noqa: E402
 )
 from api_clients import (  # noqa: E402
     BuoySnapshot, ClimatologySnapshot, InfrastructureSnapshot, ObisSnapshot,
-    Region, RegionSnapshot, SeaStateSnapshot,
+    Region, RegionSnapshot, SeaStateSnapshot, ThermalStressSnapshot,
 )
 
 _REGION = Region.from_point("Test Bay", 36.8, -121.9)
@@ -56,6 +56,16 @@ def _infrastructure() -> InfrastructureSnapshot:
     )
 
 
+def _thermal_stress(*, dhw: float = 1.0, mmm: float = 16.0,
+                    observations: int = 84) -> ThermalStressSnapshot:
+    return ThermalStressSnapshot(
+        mmm_c=mmm, mmm_month=9, mmm_source="test fixture",
+        latest_sst_c=mmm + 0.5, latest_day=date(2026, 7, 11),
+        hotspot_c=0.5, dhw_c_weeks=dhw, observations=observations,
+        window_days=84, lag_days=16,
+    )
+
+
 def _snapshot(**feeds) -> RegionSnapshot:
     return RegionSnapshot(
         region=_REGION, fetched_at=datetime.now(timezone.utc), duration_ms=1.0,
@@ -70,6 +80,7 @@ def _full_snapshot() -> RegionSnapshot:
                           age_hours=1.0),
         sea_state=SeaStateSnapshot(latitude=36.8, longitude=-121.9,
                                    current_sst_c=15.1, sst_c=[15.1]),
+        thermal_stress=_thermal_stress(),
         obis=_obis(),
         infrastructure=_infrastructure(),
     )
@@ -97,7 +108,9 @@ def test_band_thresholds_are_exact_at_boundaries() -> None:
 def test_all_components_available_uses_nominal_weights() -> None:
     result = assess_region(_full_snapshot())
     assert result.score is not None, "full snapshot must produce a score"
-    assert set(result.effective_weights) == {"thermal", "taxonomic", "pressure"}
+    assert set(result.effective_weights) == {
+        "thermal", "thermal_stress", "taxonomic", "pressure"
+    }
     for key, nominal in NOMINAL_WEIGHTS.items():
         actual = result.effective_weights[key]
         assert abs(actual - nominal) < 1e-6, (
@@ -105,6 +118,91 @@ def test_all_components_available_uses_nominal_weights() -> None:
             "components are available"
         )
     assert abs(sum(result.effective_weights.values()) - 1.0) < 1e-6
+
+
+def test_dhw_is_anchored_on_noaa_calibrated_thresholds() -> None:
+    """This is the one component whose number means something outside this
+    dashboard, so the mapping must land NOAA's published thresholds exactly
+    where the dashboard's own bands claim they are: 4 °C-weeks ("significant
+    bleaching likely") at the bottom of CRITICAL, 8 ("severe with mortality")
+    at the top of the scale."""
+    from analyzer import _score_thermal_stress
+
+    reef_lat = 24.8  # Florida Keys
+    at_zero = _score_thermal_stress(_thermal_stress(dhw=0.0), reef_lat)
+    at_threshold = _score_thermal_stress(_thermal_stress(dhw=4.0), reef_lat)
+    at_severe = _score_thermal_stress(_thermal_stress(dhw=8.0), reef_lat)
+
+    assert at_zero.score == 0.0, "no accumulation must score zero, not a floor"
+    assert abs(at_threshold.score - 70.0) < 1e-6, (
+        "DHW 4 is NOAA's bleaching threshold and must land at 70, the bottom "
+        "of the CRITICAL band"
+    )
+    assert abs(at_severe.score - 100.0) < 1e-6, "DHW 8 must saturate the scale"
+    # Beyond severe it clamps rather than running off the top.
+    assert _score_thermal_stress(_thermal_stress(dhw=25.0), reef_lat).score == 100.0
+    # Monotonic in between.
+    scores = [
+        _score_thermal_stress(_thermal_stress(dhw=d), reef_lat).score
+        for d in (0.0, 1.0, 2.0, 4.0, 6.0, 8.0)
+    ]
+    assert scores == sorted(scores), "DHW score must rise with accumulation"
+
+
+def test_bleaching_wording_is_gated_on_reef_latitude() -> None:
+    """The °C-weeks are physical at any latitude; the 4/8 bands are calibrated
+    against coral mortality. Announcing "bleaching likely" for a kelp forest
+    would be the same species of confident-but-wrong the trend guard exists to
+    prevent."""
+    from analyzer import _score_thermal_stress
+
+    keys = _score_thermal_stress(_thermal_stress(dhw=5.0), 24.8)
+    monterey = _score_thermal_stress(_thermal_stress(dhw=5.0), 36.8)
+
+    assert any("bleaching likely" in n for n in keys.notes), (
+        "a reef at DHW 5 must carry NOAA's interpretation"
+    )
+    assert not any("bleaching" in n.lower() and "not applied" not in n
+                   for n in monterey.notes), (
+        "a temperate location must not be told it is bleaching"
+    )
+    assert any("not applied" in n for n in monterey.notes), (
+        "and must say why the bands are absent"
+    )
+    # Same accumulation scores the same either way — only the wording differs.
+    assert keys.score == monterey.score
+
+
+def test_thermal_stress_degrades_without_a_fixed_baseline() -> None:
+    """No MMM means no reference point. The component must report itself
+    unavailable so its weight renormalises away, never score on a guess."""
+    from analyzer import _score_thermal_stress
+    from api_clients import ThermalStressSnapshot
+
+    for label, snapshot in [
+        ("feed missing", None),
+        ("no MMM", ThermalStressSnapshot(mmm_c=None, dhw_c_weeks=2.0)),
+        ("no window data",
+         ThermalStressSnapshot(mmm_c=28.0, dhw_c_weeks=None, observations=0)),
+    ]:
+        component = _score_thermal_stress(snapshot, 24.8)
+        assert not component.available, f"{label} must not be scored"
+        assert component.score is None, f"{label} must not invent a score"
+        assert component.unavailable_reason, f"{label} must say why"
+
+
+def test_partial_accumulation_window_lowers_quality_not_score() -> None:
+    """A half-filled window under-accumulates and would read as calm. The
+    shortfall belongs in quality (which feeds confidence), not in the score."""
+    from analyzer import _score_thermal_stress
+
+    full = _score_thermal_stress(_thermal_stress(dhw=3.0, observations=84), 24.8)
+    partial = _score_thermal_stress(_thermal_stress(dhw=3.0, observations=21), 24.8)
+
+    assert full.score == partial.score, "quality must not distort the score"
+    assert partial.quality < full.quality, (
+        "a quarter-filled window must reduce confidence in the reading"
+    )
 
 
 def test_dropped_component_renormalises_surviving_weights() -> None:
@@ -293,6 +391,10 @@ ALL = [
     test_logistic_is_bounded_and_monotonic,
     test_band_thresholds_are_exact_at_boundaries,
     test_all_components_available_uses_nominal_weights,
+    test_dhw_is_anchored_on_noaa_calibrated_thresholds,
+    test_bleaching_wording_is_gated_on_reef_latitude,
+    test_thermal_stress_degrades_without_a_fixed_baseline,
+    test_partial_accumulation_window_lowers_quality_not_score,
     test_dropped_component_renormalises_surviving_weights,
     test_blend_is_the_weighted_mean_of_components,
     test_no_components_yields_none_not_zero,
