@@ -76,10 +76,15 @@ while (-not $stopping) {
 
     Write-Log "launching streamlit (attempt $($restarts + 1)); stdout=$outLog"
 
+    # The watcher flags are pinned here, not left to .streamlit/config.toml:
+    # that file now carries the hosted defaults (watch + reload, so a deploy
+    # actually applies). An unattended overnight run wants the opposite —
+    # nothing reloads mid-run — and CLI flags outrank the config file.
     $proc = Start-Process -FilePath "python" `
         -ArgumentList "-m", "streamlit", "run", "app.py",
                       "--server.port", $Port,
                       "--server.headless", "true",
+                      "--server.runOnSave", "false",
                       "--server.fileWatcherType", "none" `
         -WorkingDirectory $projectRoot `
         -RedirectStandardOutput $outLog `

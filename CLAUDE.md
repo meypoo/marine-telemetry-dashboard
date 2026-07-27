@@ -227,8 +227,14 @@ The dashboard is expected to run overnight with nobody watching, so failures deg
   `run_overnight.ps1` redirects into `logs/`. The never-raise contract is unchanged; the difference is that a
   silent `except: pass` now leaves a trace.
 - `run_overnight.ps1` supervises the process itself, restarting it with backoff and appending to `logs/`.
-- `fileWatcherType = "none"` and `runOnSave = false` in `.streamlit/config.toml`: nothing should reload the
-  app mid-run because a file timestamp changed.
+- **The file watcher is split by environment, deliberately.** `.streamlit/config.toml` carries the *hosted*
+  values (`fileWatcherType = "auto"`, `runOnSave = true`) because on Community Cloud the only thing that ever
+  changes a file is a deploy, and that is exactly when a reload is wanted. With the watcher off, a deploy
+  logs `Updated app!` and then keeps serving the **old** modules: almost all of this app lives in imports
+  (`ui`, `terminal_render`, `data_access`) and `import` hits `sys.modules`, not disk — so a pull updates the
+  files while the running process ignores them, and the only fix is a manual Reboot. `run_overnight.ps1`
+  pins the opposite (`--server.fileWatcherType none --server.runOnSave false`) on the command line, which
+  outranks the config file, so an unattended local run still never reloads mid-run.
 
 ## Source constraints
 

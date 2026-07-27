@@ -11,8 +11,19 @@ font = "monospace"
 
 [server]
 headless = true
-runOnSave = false
-fileWatcherType = "none"
+# These two are set for the HOSTED case, where the only thing that ever changes
+# a file is a deploy — so watching is exactly what you want: Community Cloud
+# pulls the commit and the reload applies it. Without the watcher, Streamlit
+# logs "Updated app!" and keeps serving the OLD imported modules, because
+# almost all of this app lives in imports (ui, terminal_render, data_access)
+# and `import` hits sys.modules, not disk. That cost three deploys that looked
+# successful and changed nothing.
+#
+# The unattended local path wants the opposite and pins it explicitly on the
+# command line in run_overnight.ps1 (CLI beats this file), so nothing reloads
+# mid-run overnight because of a stray file timestamp.
+runOnSave = true
+fileWatcherType = "auto"
 # Long-running unattended sessions: keep websockets alive and cap upload size.
 enableWebsocketCompression = true
 maxUploadSize = 200
