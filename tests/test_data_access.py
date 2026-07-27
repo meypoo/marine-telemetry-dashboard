@@ -170,6 +170,48 @@ def test_remember_skips_scoreless_result_with_live_feeds() -> None:
     _with_temp_cache(body)
 
 
+def test_cache_keys_carry_the_snapshot_schema_version() -> None:
+    """Regression: the context tier is ``st.cache_data(persist="disk")``, which
+    pickles. Unpickling restores ``__dict__`` directly, so a field added to a
+    snapshot model does NOT gain its pydantic default on an object written by
+    the previous deploy — it is simply missing. Adding ``annual_peak_dhw`` took
+    the live dashboard down with an AttributeError on exactly this path, served
+    from a cache entry the old build had written.
+
+    Both tier keys must therefore embed the schema version, so bumping it
+    retires every stale entry instead of relying on someone clearing a cache.
+    """
+    seen: dict[str, tuple] = {}
+
+    def capture_dynamic(_region, key):  # noqa: ANN001, ANN202
+        seen["dynamic"] = key
+        return FeedBundle()  # succeed, so the context tier is reached
+
+    def capture_context(_region, key):  # noqa: ANN001, ANN202
+        seen["context"] = key
+        raise RuntimeError("stop here — the keys are all this test wants")
+
+    original = (data_access._fetch_dynamic, data_access._fetch_context)
+    data_access._fetch_dynamic, data_access._fetch_context = (
+        capture_dynamic, capture_context
+    )
+    try:
+        data_access.load_region(Region.from_point("KeyProbe", 3.0, 4.0))
+    finally:
+        data_access._fetch_dynamic, data_access._fetch_context = original
+
+    version = data_access.SNAPSHOT_SCHEMA_VERSION
+    assert isinstance(version, int) and version >= 1
+    assert version in seen["dynamic"], (
+        f"dynamic cache key {seen['dynamic']} does not carry the schema "
+        "version; a model change would serve stale pickles"
+    )
+    assert any(f"v{version}" in str(part) for part in seen["context"]), (
+        f"context cache key {seen['context']} does not carry the schema "
+        "version — this is the tier that persists to disk across deploys"
+    )
+
+
 def test_load_region_falls_back_to_memory_then_disk() -> None:
     """A failed fetch must serve the last good result and flag it stale."""
     def body(_: Path) -> None:
@@ -418,6 +460,7 @@ ALL = [
     test_compose_merges_tiers_and_times,
     test_remember_skips_empty_result,
     test_remember_skips_scoreless_result_with_live_feeds,
+    test_cache_keys_carry_the_snapshot_schema_version,
     test_load_region_falls_back_to_memory_then_disk,
     test_context_tier_retries_after_a_failed_feed,
     test_history_appends_rate_limits_and_prunes,

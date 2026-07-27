@@ -203,6 +203,15 @@ The dashboard is expected to run overnight with nobody watching, so failures deg
   otherwise sit in the cache until the UTC date rolled over. `_schedule_context_retry` therefore folds a retry
   generation into the context cache key whenever the bundle carries feed errors, spaced at least `DYNAMIC_TTL`
   apart so a persistent outage is retried once per refresh cycle rather than on every page load.
+- **Bump `SNAPSHOT_SCHEMA_VERSION` whenever a snapshot model changes.** The context tier is
+  `st.cache_data(persist="disk")`, which **pickles**. Unpickling restores an instance's `__dict__` directly,
+  so a field added to a model does *not* acquire its pydantic default on an object the previous deploy wrote —
+  it is simply absent, and the first attribute access raises `AttributeError` on a live page. Adding
+  `annual_peak_dhw` took the deployed dashboard down exactly this way, served from a cache entry the old build
+  had written. The version is folded into both tier cache keys, so bumping it retires every stale entry at
+  once. (The `.cache/*.json` last-known-good mirrors are immune — they go through `model_validate_json`, which
+  *does* apply defaults and ignores fields that no longer exist.) Guarded by
+  `test_cache_keys_carry_the_snapshot_schema_version`.
 - **Multi-user on one instance.** The two `st.cache_data` tiers are process-global and shared by *every*
   browser session, so once one visitor warms a region/day the rest hit cache and issue zero upstream calls —
   which is why a single instance serves dozens of viewers and why you must run *one* instance, not replicas

@@ -63,6 +63,18 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
+#: Bump whenever a snapshot model gains, loses or renames a field.
+#:
+#: The context tier is ``st.cache_data(persist="disk")``, which **pickles**.
+#: Unpickling restores an instance's ``__dict__`` directly, so a field added to
+#: a model does *not* pick up its pydantic default on an object written by the
+#: previous deploy — it is simply absent, and the first attribute access raises
+#: ``AttributeError`` on a live page. (The ``.cache/*.json`` mirrors are immune:
+#: they go through ``model_validate_json``, which does apply defaults.) Folding
+#: this into the cache keys retires every stale entry at once, which is cheaper
+#: and far more reliable than remembering to clear a cache during a deploy.
+SNAPSHOT_SCHEMA_VERSION = 2
+
 #: Feeds that change fast (minutes-hours): re-fetched on every timed refresh.
 DYNAMIC_FEEDS = ("buoy", "sea_state")
 #: Feeds that are stable within a day: fetched roughly once per UTC day.
@@ -649,13 +661,13 @@ def load_region(region: Region | str, nonce: int | None = None) -> LoadResult:
     """
     resolved = REGIONS_BY_CODE[region] if isinstance(region, str) else region
     code = resolved.code
-    day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_key = f"{datetime.now(timezone.utc):%Y-%m-%d}|v{SNAPSHOT_SCHEMA_VERSION}"
     gen = refresh_generation() if nonce is None else nonce
 
     try:
         dynamic = _single_flight(
-            ("dyn", code, gen),
-            lambda: _fetch_dynamic(resolved, (code, gen)),
+            ("dyn", code, gen, SNAPSHOT_SCHEMA_VERSION),
+            lambda: _fetch_dynamic(resolved, (code, gen, SNAPSHOT_SCHEMA_VERSION)),
         )
         ctx_gen = _context_generation(code)
         context = _single_flight(
