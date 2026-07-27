@@ -10,12 +10,14 @@ The score is a weighted blend of three independently computed components:
 ===================  ======  ==========================================================
 Component            Weight  Derived from
 ===================  ======  ==========================================================
-Thermal anomaly       0.45   Present SST vs a ten-year NOAA OISST day-of-year baseline,
+Thermal anomaly       0.25   Present SST vs a ten-year NOAA OISST day-of-year baseline,
                              expressed in standard deviations, plus the decadal trend.
+Accumulated heat      0.20   NOAA Coral Reef Watch Degree Heating Weeks, current and the
+stress                       recency-weighted worst of the last decade.
 Taxonomic exposure    0.30   OBIS phylum composition weighted by thermal/acidification
                              sensitivity, plus assemblage evenness.
-Anthropogenic         0.25   OpenSeaMap seamark density per 1 000 km² and the share of
-pressure                     features that mark vessel routing or berthing.
+Charted maritime      0.25   OpenSeaMap seamark density per 1 000 km² and the share of
+activity                     features that mark vessel routing or berthing.
 ===================  ======  ==========================================================
 
 Every component is computed defensively. A component that cannot be derived
@@ -606,12 +608,23 @@ def _score_taxonomic(obis: ObisSnapshot | None) -> ComponentScore:
 
 
 # --------------------------------------------------------------------------- #
-# Component 4 — anthropogenic pressure
+# Component 4 — charted maritime activity
 # --------------------------------------------------------------------------- #
 def _score_pressure(infra: InfrastructureSnapshot | None) -> ComponentScore:
-    """Score vessel-activity pressure from seamark density and composition."""
+    """Score vessel-activity pressure from seamark density and composition.
+
+    Labelled for what it measures — *charted* seamarks — rather than
+    "anthropogenic pressure", which the feed cannot support. OpenSeaMap knows
+    about buoys, beacons and shipping lanes; it knows nothing about
+    agricultural runoff, crown-of-thorns outbreaks or cyclone damage. A remote
+    reef therefore scores near zero here and that is a statement about the
+    chart, not about the reef: the Great Barrier Reef reads 0.3/100. Same
+    correction as ``PHYLUM MIX (TOP-TAXA SAMPLE)`` — name the sample, not the
+    thing you wish you had measured.
+    """
     component = ComponentScore(
-        key="pressure", label="ANTHROPOGENIC PRESSURE", weight=NOMINAL_WEIGHTS["pressure"]
+        key="pressure", label="CHARTED MARITIME ACTIVITY",
+        weight=NOMINAL_WEIGHTS["pressure"],
     )
     try:
         if infra is None:

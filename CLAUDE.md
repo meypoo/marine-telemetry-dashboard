@@ -77,7 +77,7 @@ concurrently with `return_exceptions=True`, so a dead source degrades the result
 `_BaseClient._fetch` handles retry-with-backoff then mirror rotation, recording a `TelemetryEvent` for *every*
 attempt including failures; that sink is what the console feed renders, so the log is measured rather than
 narrated. `analyzer.assess_region()` blends four components (thermal 0.25, accumulated thermal stress 0.20,
-taxonomic 0.30, pressure 0.25), each computed inside its own `try/except` — there is deliberately **no outer
+taxonomic 0.30, charted maritime activity 0.25), each computed inside its own `try/except` — there is deliberately **no outer
 catch** in `assess_region`, so a new component must carry its own guard. The thermal budget is still 0.45 in
 total; what changed when DHW landed is that it is *split* between the instantaneous reading and the
 accumulated one, leaving taxonomic and pressure untouched. Unavailable components are dropped and the surviving weights
@@ -350,6 +350,13 @@ readings are not independent.
 `PHYLUM_SENSITIVITY` is an ordinal weighting of how *exposed* an assemblage is to warming and acidification
 (calcifiers and sessile taxa highest). It is not a measurement of observed decline, and the taxonomic
 component should not be described as one.
+
+**The pressure component is named `CHARTED MARITIME ACTIVITY`, not "anthropogenic pressure".** It counts
+OpenSeaMap seamarks — buoys, beacons, shipping lanes. It knows nothing about agricultural runoff,
+crown-of-thorns outbreaks or cyclone damage, so a remote reef scores near zero and that is a fact about the
+chart rather than the reef: the Great Barrier Reef reads 0.3/100 while carrying a quarter of the blend's
+weight. Widening this needs new data sources (water-quality monitoring, disturbance records), not different
+arithmetic. Do not relabel it back.
 
 **The phylum mix is a top-N sample, not the region's composition.** `ObisClient.fetch` pulls a 200-taxa
 checklist, so `phylum_records` (and every percentage derived from it) is computed over that sample — which is
