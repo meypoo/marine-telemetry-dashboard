@@ -172,7 +172,10 @@ def _schedule_context_retry(code: str, context: FeedBundle) -> None:
     if not failed:
         _CONTEXT_RETRY.pop(code, None)
         return
-    generation, last_bump = _CONTEXT_RETRY.get(code, (0, 0.0))
+    # Sentinel is -inf, not 0.0: time.monotonic() is seconds since boot on
+    # Linux, so on a freshly booted host 0.0 reads as "bumped moments ago"
+    # and the first failure after boot would go unretried for DYNAMIC_TTL.
+    generation, last_bump = _CONTEXT_RETRY.get(code, (0, float("-inf")))
     now = time.monotonic()
     if now - last_bump >= DYNAMIC_TTL:
         _CONTEXT_RETRY[code] = (generation + 1, now)
