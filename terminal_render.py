@@ -1134,8 +1134,23 @@ def _thermal_stress_panel(snapshot: RegionSnapshot,
              small_key=True, medium_value=True),
     ]
 
+    # Outside the tropics this, not the °C-weeks, is what the current term is
+    # scored on — so it belongs on the face rather than in the drawer.
+    detail = (component.detail if component is not None else {}) or {}
+    if detail.get("mhw_multiple") is not None:
+        name = detail.get("mhw_category_name") or "--"
+        category = detail.get("mhw_category")
+        rows.append(
+            _row("Marine heatwave (Hobday)",
+                 f"{detail['mhw_multiple']:.1f}× p90 gap · "
+                 + (f"cat {category} {name}" if category else name),
+                 colour=SIGNAL if (category or 0) >= 3 else PAPER,
+                 small_key=True, medium_value=True)
+        )
+
     detail_pairs = [
         ("source", "NOAA Coral Reef Watch 5 km daily (NOAA_DHW)"),
+        ("current term scored on", str(detail.get("current_term_scale") or "--")),
         ("current DHW (°C-weeks)",
          f"{stress.dhw_c_weeks:.2f}" if stress.dhw_c_weeks is not None else "--"),
         ("worst year", str(stress.worst_year or "--")),

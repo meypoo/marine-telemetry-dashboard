@@ -320,6 +320,18 @@ lets an old severe event mask a recent near-severe one: on the GBR that scored 1
 long the damage should keep counting; `RECENT_EVENT_YEARS`/`RECOVERY_YEARS` (2 and 10) bracket published reef
 recovery times. Argue with the shape, do not present it as sourced.
 
+**Outside reef latitudes the current term is scored on Hobday, not on DHW.** NOAA's 4 and 8 °C-weeks are coral
+mortality numbers and mean nothing in a kelp forest. Hobday et al.'s marine-heatwave categories are defined on
+how far past the seasonally-varying 90th percentile a reading sits, in multiples of the (p90 − mean) gap —
+1-2× Moderate, 2-3× Strong, 3-4× Severe, >4× Extreme — so they carry the same meaning at any latitude.
+`_mhw_multiple` computes this from the OISST baseline the app already fetches, and takes over the *current*
+term when `is_reef_latitude` is false. Two deviations from the published method are stated on the panel: the
+baseline is ten completed years over ±10 days rather than thirty over ±5, and **the duration criterion cannot
+be checked at all** — a real heatwave is five or more consecutive days above the percentile, which one
+instantaneous SST cannot establish. This is the intensity of the present reading, not a confirmed event.
+The *history* term still rides the coral curve; that is the remaining approximation and the notes say so.
+Closing it needs annual MHW categories, which need per-day historical climatology the app does not fetch.
+
 **DHW's thresholds are coral, its quantity is not.** NOAA's 4 and 8 °C-week thresholds are calibrated against
 observed coral bleaching and mortality. Accumulated warm anomaly is real stress in a kelp forest too (the
 2014-16 north-east Pacific event was measured this way), so the component scores everywhere, but

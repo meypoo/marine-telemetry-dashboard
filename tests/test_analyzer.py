@@ -325,6 +325,59 @@ def test_an_old_severe_event_cannot_mask_a_recent_one() -> None:
     assert component.detail["worst_year"] == 2017
 
 
+def test_temperate_current_reading_uses_hobday_not_coral_thresholds() -> None:
+    """NOAA's 4 and 8 °C-weeks are coral mortality numbers and mean nothing in
+    a kelp forest. Hobday's marine-heatwave categories are percentile-based, so
+    they carry the same meaning at any latitude and take over the current term
+    outside reef latitudes."""
+    from analyzer import _mhw_category, _mhw_multiple, _score_thermal_stress
+
+    clim = _climatology(mean=14.0)          # baseline_p90 == mean + 1.0
+    # 3x the (p90 - mean) gap is Hobday category III, Severe.
+    severe_sst = 14.0 + 3.0
+
+    multiple = _mhw_multiple(severe_sst, clim)
+    assert multiple is not None and abs(multiple - 3.0) < 1e-9
+    assert _mhw_category(multiple) == (3, "Severe")
+
+    temperate = _score_thermal_stress(
+        _thermal_stress(dhw=0.5, peaks={2026: 0.5}), 36.8,
+        climatology=clim, current_sst_c=severe_sst,
+    )
+    assert temperate.score >= 70.0, (
+        f"a Severe marine heatwave scored {temperate.score}; 0.5 °C-weeks on "
+        "the coral scale would have read as almost nothing"
+    )
+    assert temperate.detail["current_term_scale"] == "Hobday MHW"
+    assert any("five consecutive days" in n for n in temperate.notes), (
+        "the duration criterion cannot be checked and must be disclosed"
+    )
+
+    # A reef at the same latitude-independent intensity keeps the coral scale,
+    # because there the calibrated thresholds are the better instrument.
+    reef = _score_thermal_stress(
+        _thermal_stress(dhw=0.5, peaks={2026: 0.5}), 24.8,
+        climatology=clim, current_sst_c=severe_sst,
+    )
+    assert reef.detail["current_term_scale"] == "coral DHW"
+
+
+def test_mhw_scoring_degrades_without_a_baseline_percentile() -> None:
+    """No percentile means no Hobday category. The component must fall back to
+    the °C-week scale and say so, not silently score zero."""
+    from analyzer import _mhw_multiple, _score_thermal_stress
+
+    assert _mhw_multiple(15.0, None) is None
+    assert _mhw_multiple(None, _climatology()) is None
+
+    component = _score_thermal_stress(
+        _thermal_stress(dhw=6.0, peaks={2026: 6.0}), 36.8,
+        climatology=None, current_sst_c=None,
+    )
+    assert component.available and component.score > 0
+    assert any("falls back to the coral-derived" in n for n in component.notes)
+
+
 def test_current_reading_wins_when_it_is_worse_than_history() -> None:
     """A reef cooking right now must not be discounted because its past was
     calm — the component takes the worse of the two readings."""
@@ -541,6 +594,8 @@ ALL = [
     test_past_bleaching_still_counts_in_the_cool_season,
     test_older_events_count_less_than_recent_ones,
     test_an_old_severe_event_cannot_mask_a_recent_one,
+    test_temperate_current_reading_uses_hobday_not_coral_thresholds,
+    test_mhw_scoring_degrades_without_a_baseline_percentile,
     test_current_reading_wins_when_it_is_worse_than_history,
     test_missing_history_still_scores_the_current_window,
     test_dropped_component_renormalises_surviving_weights,

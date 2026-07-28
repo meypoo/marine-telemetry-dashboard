@@ -366,6 +366,46 @@ def _dhw_to_score(dhw: float) -> float:
     return _clamp(70.0 + (dhw - DHW_BLEACHING_LIKELY) / span * 30.0)
 
 
+def _mhw_multiple(
+    current_sst_c: float | None, climatology: ClimatologySnapshot | None
+) -> float | None:
+    """Marine-heatwave intensity after Hobday et al., in multiples of (p90 − mean).
+
+    Hobday's categories are defined on how far past the seasonally-varying 90th
+    percentile a reading sits, measured in units of the gap between that
+    percentile and the climatological mean: 1-2x Moderate, 2-3x Strong, 3-4x
+    Severe, >4x Extreme. Unlike Degree Heating Weeks the definition is
+    percentile-based rather than calibrated against coral mortality, so it means
+    the same thing in a kelp forest as on a reef — which is exactly why it is
+    used outside reef latitudes here.
+
+    Two honest deviations from the published method, both stated on the panel:
+    the baseline is this app's ten completed years over a ±10-day window rather
+    than Hobday's thirty years over ±5, and the **duration criterion cannot be
+    checked at all**. A real marine heatwave is five or more consecutive days
+    above the percentile; one instantaneous SST cannot establish that. This is
+    the intensity of the present reading, not a confirmed event.
+    """
+    if current_sst_c is None or climatology is None:
+        return None
+    mean, p90 = climatology.baseline_mean, climatology.baseline_p90
+    if mean is None or p90 is None:
+        return None
+    gap = p90 - mean
+    if gap <= 1e-9:
+        return None
+    return (current_sst_c - mean) / gap
+
+
+def _mhw_category(multiple: float) -> tuple[int, str]:
+    """Hobday category number and name for an intensity multiple."""
+    if multiple < 1.0:
+        return 0, "below the heatwave threshold"
+    return min(4, int(multiple)), (
+        {1: "Moderate", 2: "Strong", 3: "Severe", 4: "Extreme"}[min(4, int(multiple))]
+    )
+
+
 def _recency_weight(years_since: int) -> float:
     """How much a past bleaching event still counts, 1.0 down to 0.0.
 
@@ -385,7 +425,10 @@ def _recency_weight(years_since: int) -> float:
 
 
 def _score_thermal_stress(
-    stress: ThermalStressSnapshot | None, latitude: float
+    stress: ThermalStressSnapshot | None,
+    latitude: float,
+    climatology: ClimatologySnapshot | None = None,
+    current_sst_c: float | None = None,
 ) -> ComponentScore:
     """Score accumulated heat stress from NOAA Coral Reef Watch.
 
@@ -417,7 +460,21 @@ def _score_thermal_stress(
             )
             return component
 
+        reef = is_reef_latitude(latitude)
         current_score = _dhw_to_score(current) if current is not None else 0.0
+
+        # Outside reef latitudes the DHW thresholds are the wrong instrument for
+        # the *current* reading — 4 and 8 °C-weeks are coral mortality numbers.
+        # Hobday's marine-heatwave categories are percentile-based and therefore
+        # mean the same thing at any latitude, so they take over the current term
+        # there. Anchored so Severe (3x) lands at 75, just inside CRITICAL, and
+        # Extreme (4x) saturates.
+        mhw_multiple = _mhw_multiple(current_sst_c, climatology)
+        mhw_category = mhw_name = None
+        if mhw_multiple is not None:
+            mhw_category, mhw_name = _mhw_category(mhw_multiple)
+            if not reef:
+                current_score = _clamp(mhw_multiple / 4.0 * 100.0)
 
         # Every year is aged on its own, and the strongest surviving signal
         # wins. Decaying only the single worst year would let an old severe
@@ -443,7 +500,6 @@ def _score_thermal_stress(
             0.0, 1.0,
         )
 
-        reef = is_reef_latitude(latitude)
         if reef and current is not None:
             if current >= DHW_SEVERE:
                 component.notes.append(
@@ -456,13 +512,30 @@ def _score_thermal_stress(
                     f"likely (>= {DHW_BLEACHING_LIKELY:.0f})"
                 )
         if not reef:
-            # The °C-weeks are a real physical quantity at any latitude; the
-            # *scale* they are scored on is derived from coral outcomes, which
-            # is worth admitting rather than glossing.
+            if mhw_multiple is not None:
+                component.notes.append(
+                    f"current reading scored as a marine heatwave (Hobday): "
+                    f"{mhw_multiple:.1f}x the 90th-percentile gap — "
+                    f"category {mhw_category} {mhw_name}"
+                    if mhw_category else
+                    f"current reading {mhw_multiple:.1f}x the 90th-percentile "
+                    "gap — below the heatwave threshold"
+                )
+                component.notes.append(
+                    "intensity only: a Hobday heatwave also requires five "
+                    "consecutive days above the percentile, which a single SST "
+                    "reading cannot establish"
+                )
+            else:
+                component.notes.append(
+                    "no baseline percentile available, so the current reading "
+                    "falls back to the coral-derived °C-week scale"
+                )
+            # The history term still rides on the coral curve, which is the
+            # remaining approximation here and is not hidden.
             component.notes.append(
-                "outside reef latitudes: the °C-weeks are real accumulated warm "
-                "anomaly, but both the scale and the recovery decay are derived "
-                "from coral outcomes, so read the magnitude and not the band"
+                "the peak-year history is still scaled on coral thresholds; "
+                "outside reef latitudes read its magnitude, not its band"
             )
 
         if driving_year is not None and as_of is not None:
@@ -523,6 +596,12 @@ def _score_thermal_stress(
             "history_years": stress.history_years,
             "history_observations": stress.history_observations,
             "reef_latitude": reef,
+            "mhw_multiple": (
+                round(mhw_multiple, 2) if mhw_multiple is not None else None
+            ),
+            "mhw_category": mhw_category,
+            "mhw_category_name": mhw_name,
+            "current_term_scale": "coral DHW" if reef else "Hobday MHW",
         }
     except Exception as exc:  # noqa: BLE001 - assess_region has no outer catch
         component.available = False
@@ -736,7 +815,10 @@ def assess_region(snapshot: RegionSnapshot) -> StressAssessment:
         snapshot.climatology, snapshot.buoy, snapshot.sea_state
     )
     thermal_stress = _score_thermal_stress(
-        snapshot.thermal_stress, snapshot.region.centroid[0]
+        snapshot.thermal_stress,
+        snapshot.region.centroid[0],
+        climatology=snapshot.climatology,
+        current_sst_c=thermal_context.get("current_sst_c"),
     )
     taxonomic = _score_taxonomic(snapshot.obis)
     pressure = _score_pressure(snapshot.infrastructure)
