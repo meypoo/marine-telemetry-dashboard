@@ -128,6 +128,49 @@ def test_all_components_available_uses_nominal_weights() -> None:
     assert abs(sum(result.effective_weights.values()) - 1.0) < 1e-6
 
 
+def test_microbial_records_do_not_drive_the_assemblage_score() -> None:
+    """OBIS carries whole metagenomics surveys. At Massachusetts Bay measured
+    live, Proteobacteria alone is 48.5% of the checklist and prokaryotes are
+    ~72%. None of them appear in PHYLUM_SENSITIVITY, so before this filter they
+    all landed on the "unknown" default and then drove both the sensitivity
+    mean *and* the evenness term — a microbial survey scored by a table written
+    for calcifiers.
+    """
+    from analyzer import _score_taxonomic
+
+    # What the region actually looks like once the bacteria are set aside.
+    animals = {"Chordata": 96, "Arthropoda": 60, "Mollusca": 40, "Annelida": 30}
+    clean = ObisSnapshot(
+        records=900_000, species=1791, taxa=1791, datasets=120,
+        species_level_records=800_000, year_min=1871, year_max=2026,
+        phylum_records=animals, checklist_sampled=200,
+        non_target_records=0,
+    )
+    contaminated = ObisSnapshot(
+        records=900_000, species=1791, taxa=1791, datasets=120,
+        species_level_records=800_000, year_min=1871, year_max=2026,
+        phylum_records=animals, checklist_sampled=200,
+        non_target_records=580,  # ~72% of the sample
+        non_target_kingdoms={"Bacteria": 520, "Archaea": 60},
+    )
+
+    a, b = _score_taxonomic(clean), _score_taxonomic(contaminated)
+    assert a.score == b.score, (
+        "excluded records must not reach the score at all — the mix is computed "
+        "over the survivors either way"
+    )
+    assert b.quality < a.quality, (
+        "a sample that was mostly microbial is a thinner basis for an "
+        "assemblage claim and must cost confidence"
+    )
+    assert any("excluded" in n and "Bacteria" in n for n in b.notes), (
+        "the panel must say what was dropped and why"
+    )
+    assert not any("excluded" in n for n in a.notes), (
+        "a clean sample should not carry the caveat"
+    )
+
+
 def test_dhw_is_anchored_on_noaa_calibrated_thresholds() -> None:
     """This is the one component whose number means something outside this
     dashboard, so the mapping must land NOAA's published thresholds exactly
@@ -491,6 +534,7 @@ ALL = [
     test_logistic_is_bounded_and_monotonic,
     test_band_thresholds_are_exact_at_boundaries,
     test_all_components_available_uses_nominal_weights,
+    test_microbial_records_do_not_drive_the_assemblage_score,
     test_dhw_is_anchored_on_noaa_calibrated_thresholds,
     test_bleaching_wording_is_gated_on_reef_latitude,
     test_thermal_stress_degrades_without_any_dhw_data,

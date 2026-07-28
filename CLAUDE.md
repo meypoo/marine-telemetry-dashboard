@@ -358,6 +358,17 @@ chart rather than the reef: the Great Barrier Reef reads 0.3/100 while carrying 
 weight. Widening this needs new data sources (water-quality monitoring, disturbance records), not different
 arithmetic. Do not relabel it back.
 
+**Prokaryotes are excluded from the phylum mix, and that is load-bearing.** OBIS carries whole metagenomics
+surveys, and where one lands on a region it can be most of the checklist: measured at Massachusetts Bay,
+**82% of the sample is Bacteria and Archaea** (Proteobacteria alone 48.5%). None of them have an entry in
+`PHYLUM_SENSITIVITY`, which ranks marine animals and algae, so before `NON_TARGET_KINGDOMS` they all landed on
+`DEFAULT_SENSITIVITY` and then drove *both* the sensitivity mean and the evenness term — a microbial survey
+scored by a table written for calcifiers. The excluded share is reported on the stats strip and reduces the
+component's quality, because a sample that was mostly microbial is a thin basis for an assemblage claim
+however clean the remainder looks. The component also states what fraction of the *surviving* mix still falls
+back to the default (30% at Massachusetts Bay), since that default is a placeholder for "unknown" and its
+weight should be visible rather than inferred.
+
 **The phylum mix is a top-N sample, not the region's composition.** `ObisClient.fetch` pulls a 200-taxa
 checklist, so `phylum_records` (and every percentage derived from it) is computed over that sample — which is
 biased toward abundant, heavily-recorded groups by construction — while the occurrence count in the stats

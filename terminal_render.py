@@ -982,6 +982,11 @@ def _stats_strip(snapshot: RegionSnapshot, assessment: StressAssessment,
              f"{obis.year_min}–{obis.year_max}" if obis and obis.year_min else "--"),
         stat("Taxa sampled for mix",
              f"{obis.checklist_sampled:,} of {obis.taxa:,}" if obis else "--"),
+        # OBIS carries whole metagenomics surveys; where one dominates a region
+        # this is the majority of the sample, and the mix describes what is
+        # left. Saying so on the strip keeps that from being invisible.
+        stat("Microbial records excluded",
+             f"{obis.non_target_share:.0%}" if obis else "--"),
         stat("Weighted sensitivity", fmt(detail.get("weighted_sensitivity"), ".3f")),
         stat("Assemblage evenness", fmt(detail.get("evenness"), ".3f")),
         stat("Dominant phylum (in sample)",

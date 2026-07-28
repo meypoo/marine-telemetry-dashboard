@@ -73,7 +73,7 @@ _T = TypeVar("_T")
 #: they go through ``model_validate_json``, which does apply defaults.) Folding
 #: this into the cache keys retires every stale entry at once, which is cheaper
 #: and far more reliable than remembering to clear a cache during a deploy.
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 
 #: Feeds that change fast (minutes-hours): re-fetched on every timed refresh.
 DYNAMIC_FEEDS = ("buoy", "sea_state")

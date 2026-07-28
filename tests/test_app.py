@@ -174,10 +174,13 @@ def _fidelity() -> None:
         "OISST bars == years covered (<=10)": bars == years_covered and 1 <= bars <= 10,
         "log grid columns": "140px 140px 160px 70px 80px 80px 30px" in css,
         "6 stat tiles": body.count('class="tm-tile"') == 6,
-        # 16, not the handoff's 15: a "Taxa sampled for mix" row was added so
-        # the phylum percentages are not read as the region's full composition
-        # (they are computed over the top-N checklist sample).
-        "16 stat rows": body.count('class="tm-statrow"') == 16,
+        # 17, not the handoff's 15. Both additions are disclosures the handoff
+        # could not have anticipated: "Taxa sampled for mix", so the phylum
+        # percentages are not read as the region's full composition, and
+        # "Microbial records excluded", because a metagenomics dataset can be
+        # most of a region's checklist (82% at Massachusetts Bay) and the mix
+        # describes only what is left.
+        "17 stat rows": body.count('class="tm-statrow"') == 17,
         "hbar rows track feed data (<=12)": (
             body.count('class="tm-hrow"') == expected_hrows and expected_hrows <= 12
         ),

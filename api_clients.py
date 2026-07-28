@@ -111,6 +111,18 @@ def is_reef_latitude(latitude: float) -> bool:
     return abs(latitude) <= REEF_LATITUDE_LIMIT
 
 
+#: Kingdoms the phylum mix deliberately drops. ``PHYLUM_SENSITIVITY`` ranks how
+#: exposed *marine animals and algae* are to warming and acidification — it has
+#: no entry for a bacterium and no basis for inventing one. OBIS carries large
+#: metagenomics datasets, so leaving these in means the majority of a region's
+#: sample can land on the "unknown" default and then drive both the sensitivity
+#: mean and the evenness term. Measured at Massachusetts Bay: Proteobacteria
+#: 48.5%, prokaryotes together ~72% of the checklist.
+NON_TARGET_KINGDOMS: Final[frozenset[str]] = frozenset(
+    {"Bacteria", "Archaea", "Viruses", "Viroids"}
+)
+
+
 # --------------------------------------------------------------------------- #
 # Regions
 # --------------------------------------------------------------------------- #
@@ -482,13 +494,27 @@ class ObisSnapshot(BaseModel):
     species_level_records: int
     year_min: int | None
     year_max: int | None
+    #: Phylum composition of the checklist sample, **prokaryotes and viruses
+    #: excluded** — see ``NON_TARGET_KINGDOMS``.
     phylum_records: dict[str, int] = Field(default_factory=dict)
     top_taxa: list[dict[str, Any]] = Field(default_factory=list)
     checklist_sampled: int = 0
+    #: Records dropped for being outside the scope of the sensitivity table,
+    #: and which kingdoms they came from. Carried rather than silently
+    #: discarded: at Massachusetts Bay this is the *majority* of the sample, and
+    #: a reader deserves to know the mix was computed over the remainder.
+    non_target_records: int = 0
+    non_target_kingdoms: dict[str, int] = Field(default_factory=dict)
 
     @property
     def total_classified_records(self) -> int:
         return sum(self.phylum_records.values())
+
+    @property
+    def non_target_share(self) -> float:
+        """Fraction of the sampled checklist that was outside scope, 0-1."""
+        total = self.total_classified_records + self.non_target_records
+        return self.non_target_records / total if total else 0.0
 
 
 class ObisClient(_BaseClient):
@@ -519,11 +545,25 @@ class ObisClient(_BaseClient):
         results: list[dict[str, Any]] = checklist.get("results") or []
 
         phylum_records: dict[str, int] = {}
+        non_target_kingdoms: dict[str, int] = {}
         for entry in results:
-            phylum = entry.get("phylum") or entry.get("kingdom") or "Unassigned"
             count = entry.get("records") or 0
-            if isinstance(count, (int, float)) and count > 0:
-                phylum_records[phylum] = phylum_records.get(phylum, 0) + int(count)
+            if not isinstance(count, (int, float)) or count <= 0:
+                continue
+            kingdom = entry.get("kingdom") or ""
+            # A metagenomics dataset can dominate an entire region's checklist:
+            # at Massachusetts Bay, Proteobacteria alone is 48.5% and prokaryotes
+            # together are ~72%. They carry no entry in PHYLUM_SENSITIVITY, so
+            # they would all land on the "unknown" default and then drive both
+            # the sensitivity mean and the evenness term — a microbial survey
+            # scored by a table written for calcifiers.
+            if kingdom in NON_TARGET_KINGDOMS:
+                non_target_kingdoms[kingdom] = (
+                    non_target_kingdoms.get(kingdom, 0) + int(count)
+                )
+                continue
+            phylum = entry.get("phylum") or kingdom or "Unassigned"
+            phylum_records[phylum] = phylum_records.get(phylum, 0) + int(count)
 
         top_taxa = [
             {
@@ -534,6 +574,7 @@ class ObisClient(_BaseClient):
                 "records": int(e.get("records") or 0),
             }
             for e in results[:40]
+            if (e.get("kingdom") or "") not in NON_TARGET_KINGDOMS
         ]
 
         year_range = stats.get("yearrange") or [None, None]
@@ -548,6 +589,10 @@ class ObisClient(_BaseClient):
             phylum_records=phylum_records,
             top_taxa=top_taxa,
             checklist_sampled=len(results),
+            non_target_records=sum(non_target_kingdoms.values()),
+            non_target_kingdoms=dict(
+                sorted(non_target_kingdoms.items(), key=lambda kv: -kv[1])
+            ),
         )
 
 

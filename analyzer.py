@@ -577,10 +577,38 @@ def _score_taxonomic(obis: ObisSnapshot | None) -> ComponentScore:
                 recency = _clamp(1.0 - (lag - 2) / 20.0, 0.2, 1.0)
                 component.notes.append(f"latest OBIS record is {lag} years old")
 
+        # A sample that was mostly microbial before filtering is a thin basis
+        # for an assemblage claim, however clean the remainder looks.
+        non_target = obis.non_target_share
+        if non_target > 0.05:
+            kingdoms = "/".join(obis.non_target_kingdoms) or "non-target kingdoms"
+            component.notes.append(
+                f"{non_target:.0%} of the checklist sample was {kingdoms}, excluded "
+                "before weighting — the sensitivity table ranks marine animals and "
+                "algae and has no basis for a prokaryote"
+            )
+
+        # Even after filtering, plenty of legitimate marine phyla have no entry
+        # in the table and fall back to DEFAULT_SENSITIVITY. That default is a
+        # placeholder for "unknown", so how much of the mix rests on it is a
+        # property the reader should be able to see rather than infer.
+        unranked = sum(
+            share for phylum, share in shares.items()
+            if phylum not in PHYLUM_SENSITIVITY
+        )
+        if unranked > 0.20:
+            component.notes.append(
+                f"{unranked:.0%} of the weighted mix has no entry in the "
+                f"sensitivity table and uses the {DEFAULT_SENSITIVITY:.2f} default"
+            )
+
         dominant = max(shares.items(), key=lambda kv: kv[1])
         component.score = _clamp(score)
         component.available = True
-        component.quality = _clamp(record_adequacy * recency, 0.0, 1.0)
+        component.quality = _clamp(
+            record_adequacy * recency * (1.0 - _clamp(non_target, 0.0, 0.6)),
+            0.0, 1.0,
+        )
         component.detail = {
             "weighted_sensitivity": round(weighted_sensitivity, 3),
             "sensitivity_term": round(sensitivity_score, 1),
@@ -594,6 +622,9 @@ def _score_taxonomic(obis: ObisSnapshot | None) -> ComponentScore:
             "datasets": obis.datasets,
             "checklist_sampled": obis.checklist_sampled,
             "year_range": [obis.year_min, obis.year_max],
+            "non_target_share": round(non_target, 3),
+            "non_target_kingdoms": obis.non_target_kingdoms,
+            "unranked_share": round(unranked, 3),
         }
         component.notes.append(
             f"assemblage weighted from top {obis.checklist_sampled} taxa "
